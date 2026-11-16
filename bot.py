@@ -7,8 +7,9 @@ import uuid
 import random
 import json
 import gc
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-import requests
+from curl_cffi import requests as cffi_requests
 from curl_cffi.requests import AsyncSession
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -45,6 +46,58 @@ class Form(StatesGroup):
     waiting_for_proxies = State()
 
 # ==============================================================================
+# 🛒 PROXY NORMALIZATION & CHECKER ENGINE
+# ==============================================================================
+def parse_proxy(line: str) -> str:
+    """Normalize raw proxy string into standard http URL format[cite: 1]."""
+    clean = line.strip().replace("http://", "").replace("https://", "")
+    if "@" in clean:
+        return f"http://{clean}"
+    parts = clean.split(":")
+    if len(parts) == 4:
+        host, port, user, password = parts
+        return f"http://{user}:{password}@{host}:{port}"
+    elif len(parts) == 2:
+        return f"http://{clean}"
+    return f"http://{clean}"
+
+def test_proxy_sync(proxy: str):
+    """Test a single proxy synchronously using curl_cffi chrome impersonation[cite: 1]."""
+    start = time.time()
+    try:
+        r = cffi_requests.get(
+            "https://api.ipify.org?format=json",
+            proxies={"http": proxy, "https": proxy},
+            timeout=10,
+            impersonate="chrome120",
+        )
+        latency = time.time() - start
+        if r.status_code == 200:
+            try:
+                ip = r.json().get("ip", "?")
+            except Exception:
+                ip = "?"
+            return True, latency, ip, proxy
+        return False, latency, f"HTTP {r.status_code}", proxy
+    except Exception as e:
+        err = str(e).split("See https")[0].strip()
+        return False, time.time() - start, err, proxy
+
+# Track used proxies in current session to prevent IP reuse
+USED_PROXIES = set()
+
+def get_unique_proxy():
+    available = [p for p in USER_DATA["proxies"] if p not in USED_PROXIES]
+    if not available:
+        USED_PROXIES.clear()
+        available = USER_DATA["proxies"]
+    if available:
+        p = random.choice(available)
+        USED_PROXIES.add(p)
+        return p
+    return None
+
+# ==============================================================================
 # 🛒 HERO11 ASYNC CLIENT ENGINE & HELPERS
 # ==============================================================================
 def parse_firebase_links(text: str):
@@ -73,20 +126,6 @@ def has_otp_pattern(messages_dict):
     valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
     return len(valid_otps) > 0
 
-# Track used proxies in current session to prevent IP reuse
-USED_PROXIES = set()
-
-def get_unique_proxy():
-    available = [p for p in USER_DATA["proxies"] if p not in USED_PROXIES]
-    if not available:
-        USED_PROXIES.clear()
-        available = USER_DATA["proxies"]
-    if available:
-        p = random.choice(available)
-        USED_PROXIES.add(p)
-        return p
-    return None
-
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
     
@@ -101,7 +140,7 @@ class AsyncHero11Client:
         
         self.invite_code = invite_code
         self.device_id = uuid.uuid4().hex
-        self.proxy = get_unique_proxy()  # Force unique proxy per client instance
+        self.proxy = get_unique_proxy()
         self.session = AsyncSession(proxy=self.proxy) if self.proxy else AsyncSession()
         self.access_token = None
         self.attribute_uuid = None
@@ -226,7 +265,6 @@ class AsyncHero11Client:
         
         if result and result.get("code") == 0:
             self.access_token = result.get("data", {}).get("accessToken")
-            # Strict validation: Check if account got flagged or IP limited
             user_info = result.get("data", {}).get("user", {})
             if user_info and user_info.get("isRestricted") is True:
                 return "IP_LIMITED"
@@ -279,7 +317,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{current_code}</code>\n"
-        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded (Rotation Enabled 🔄)\n\n"
+        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded (Chrome-Impersonated Health Checker ⚡)\n\n"
         "Select an option below:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -337,17 +375,22 @@ async def cb_add_proxies(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
     await state.set_state(Form.waiting_for_proxies)
-    await callback.message.answer("🌐 Please send your HTTP proxies (one per line, format: `http://ip:port` or `http://user:pass@ip:port`):")
+    await callback.message.answer("🌐 Please send your HTTP proxies (one per line, format: `ip:port:user:pass`, `user:pass@ip:port`, or `http://ip:port`):")
     await callback.answer()
 
 @dp.message(Form.waiting_for_proxies)
 async def process_proxies_input(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    new_proxies = [p.strip() for p in message.text.split("\n") if p.strip() and p.startswith("http")]
+    new_proxies = []
+    for line in message.text.split("\n"):
+        line = line.strip()
+        if line and not line.startswith("#"):
+            new_proxies.append(parse_proxy(line))
+    
     USER_DATA["proxies"].extend(new_proxies)
     await state.clear()
-    await message.answer(f"✅ Added {len(new_proxies)} HTTP proxies! Total loaded: {len(USER_DATA['proxies'])}", parse_mode="HTML", reply_markup=get_main_menu())
+    await message.answer(f"✅ Added {len(new_proxies)} normalized HTTP proxies! Total loaded: {len(USER_DATA['proxies'])}", parse_mode="HTML", reply_markup=get_main_menu())
 
 @dp.callback_query(F.data == "check_devices")
 async def cb_check_devices(callback: types.CallbackQuery):
@@ -384,18 +427,37 @@ async def cb_check_proxies(callback: types.CallbackQuery):
         await callback.answer("❌ No proxies loaded!", show_alert=True)
         return
 
-    status_msg = await callback.message.answer(f"⚡ Testing {len(USER_DATA['proxies'])} proxies...")
-    working = 0
-    import aiohttp
-    async with aiohttp.ClientSession() as session:
-        for p in USER_DATA["proxies"]:
-            try:
-                async with session.get("https://httpbin.org/ip", proxy=p, timeout=5) as r:
-                    if r.status == 200:
-                        working += 1
-            except Exception:
-                pass
-    await status_msg.edit_text(f"⚡ Proxy Health Check Complete!\n🟢 Working Proxies: {working}/{len(USER_DATA['proxies'])}", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer(f"⚡ Testing {len(USER_DATA['proxies'])} proxies concurrently using Chrome impersonation...")
+    
+    alive_count = 0
+    total_proxies = len(USER_DATA['proxies'])
+    
+    # Run concurrent health checking using ThreadPoolExecutor
+    def run_tests():
+        nonlocal alive_count
+        alive_list = []
+        with ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(test_proxy_sync, p): p for p in USER_DATA["proxies"]}
+            for future in as_completed(futures):
+                ok, latency, info, p = future.result()
+                if ok:
+                    alive_count += 1
+                    alive_list.append(p)
+        return alive_list
+
+    # Run in executor loop to avoid blocking telegram event loop
+    alive_proxies = await asyncio.to_thread(run_tests)
+    
+    # Auto-filter and keep only live proxies in memory
+    USER_DATA["proxies"] = alive_proxies
+
+    await status_msg.edit_text(
+        f"⚡ <b>Proxy Health Check Complete!</b>\n"
+        f"🟢 <b>Alive & Fast Proxies:</b> {alive_count}/{total_proxies}\n"
+        f"💡 <i>Dead proxies have been automatically purged from memory.</i>",
+        parse_mode="HTML",
+        reply_markup=get_main_menu()
+    )
     await callback.answer()
 
 @dp.callback_query(F.data == "stop_automation")
@@ -561,14 +623,13 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     registered_numbers.append(f"{phone} (DB: {db_short_id})")
                     await logger.set_text(f"✅ [DB: {db_short_id}] SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
                 elif v_res == "IP_LIMITED":
-                    # Skip device/proxy due to backend IP rate limiting
                     skipped_phones.add(phone)
                     await logger.set_text(f"⚠️ IP Limited / Restricted by Hero11. Rotating proxy...")
                 else:
                     skipped_phones.add(phone)
 
                 await client.close()
-                await asyncio.sleep(3.0)  # Safe delay to prevent IP flooding
+                await asyncio.sleep(3.0)
 
             USER_DATA["is_running"] = False
             if success_count >= total_needed:
