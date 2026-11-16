@@ -52,10 +52,14 @@ def parse_firebase_link(link: str):
     link = link.strip()
     if not link or link.startswith("#"):
         return None
-    if not link.startswith("http"):
-        link = "https://" + link
-    if "firebaseio.com" in link or "firebasedatabase.app" in link:
-        return link if link.endswith("/") else link + "/"
+    # Strip any accidental protocol or port trailing issues (e.g., .comhttps:443)
+    link = re.sub(r'https?://', '', link)
+    link = link.split('https:')[0].split('http:')[0].split(':')[0].strip('/')
+    if not link:
+        return None
+    clean_url = f"https://{link}/"
+    if "firebaseio.com" in clean_url or "firebasedatabase.app" in clean_url:
+        return clean_url
     return None
 
 def extract_phone(messages_dict):
@@ -218,10 +222,11 @@ def get_main_menu():
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Add Firebase", callback_data="add_firebase"),
-         InlineKeyboardButton(text="📝 Add Refer Code (Max 1)", callback_data="add_codes")],
-        [InlineKeyboardButton(text="🌐 Add Proxies (HTTP)", callback_data="add_proxies"),
-         InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices")],
-        [InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
+         InlineKeyboardButton(text="🗑️ Clear Firebase", callback_data="clear_firebase")],
+        [InlineKeyboardButton(text="📝 Add Refer Code (Max 1)", callback_data="add_codes"),
+         InlineKeyboardButton(text="🌐 Add Proxies (HTTP)", callback_data="add_proxies")],
+        [InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices"),
+         InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
         [InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
     ])
 
@@ -251,7 +256,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     current_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "Not Set ❌"
     text = (
         "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
-        f"🔗 <b>Firebase:</b> {'Configured ✅' if USER_DATA['firebase'] else 'Not Set ❌'}\n"
+        f"🔗 <b>Firebase:</b> {'Configured ✅ (' + USER_DATA['firebase'] + ')' if USER_DATA['firebase'] else 'Not Set ❌'}\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{current_code}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded\n\n"
         "Select an option below:"
@@ -277,6 +282,14 @@ async def process_firebase_input(message: types.Message, state: FSMContext):
     USER_DATA["firebase"] = parsed
     await state.clear()
     await message.answer(f"✅ Firebase saved successfully!\n<code>{parsed}</code>", parse_mode="HTML", reply_markup=get_main_menu())
+
+@dp.callback_query(F.data == "clear_firebase")
+async def cb_clear_firebase(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    USER_DATA["firebase"] = None
+    await callback.message.answer("🗑️ <b>Firebase database cleared successfully!</b>", parse_mode="HTML", reply_markup=get_main_menu())
+    await callback.answer()
 
 @dp.callback_query(F.data == "add_codes")
 async def cb_add_codes(callback: types.CallbackQuery, state: FSMContext):
