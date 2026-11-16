@@ -31,10 +31,10 @@ TIMEOUT = 30
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# In-memory storage for session configurations
+# In-memory storage for session configurations (Strictly 1 code max)
 USER_DATA = {
     "firebase": None,
-    "codes": [],
+    "codes": [],  # Max length enforced to 1
     "proxies": []
 }
 
@@ -212,7 +212,7 @@ class AsyncHero11Client:
 def get_main_menu():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Add Firebase", callback_data="add_firebase"),
-         InlineKeyboardButton(text="📝 Add Refer Code", callback_data="add_codes")],
+         InlineKeyboardButton(text="📝 Add Refer Code (Max 1)", callback_data="add_codes")],
         [InlineKeyboardButton(text="🌐 Add Proxies (HTTP)", callback_data="add_proxies"),
          InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices")],
         [InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
@@ -242,10 +242,11 @@ async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
     await state.clear()
+    current_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "Not Set ❌"
     text = (
         "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
         f"🔗 <b>Firebase:</b> {'Configured ✅' if USER_DATA['firebase'] else 'Not Set ❌'}\n"
-        f"📝 <b>Refer Codes:</b> {len(USER_DATA['codes'])} loaded\n"
+        f"📝 <b>Active Refer Code (Max 1):</b> <code>{current_code}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded\n\n"
         "Select an option below:"
     )
@@ -276,17 +277,21 @@ async def cb_add_codes(callback: types.CallbackQuery, state: FSMContext):
     if callback.from_user.id != ADMIN_ID:
         return
     await state.set_state(Form.waiting_for_codes)
-    await callback.message.answer("📝 Please send your referral codes (one code per line):")
+    await callback.message.answer("📝 Please send your <b>single</b> referral code (strictly max 1 allowed):")
     await callback.answer()
 
 @dp.message(Form.waiting_for_codes)
 async def process_codes_input(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    new_codes = [c.strip().upper() for c in message.text.split("\n") if c.strip()]
-    USER_DATA["codes"].extend(new_codes)
+    code = message.text.strip().upper()
+    if not code:
+        await message.answer("❌ Code cannot be empty. Try again:")
+        return
+    # Strictly enforce max 1 code
+    USER_DATA["codes"] = [code]
     await state.clear()
-    await message.answer(f"✅ Added {len(new_codes)} codes! Total loaded: {len(USER_DATA['codes'])}", reply_markup=get_main_menu())
+    await message.answer(f"✅ Active Refer Code set to: <code>{code}</code> (Strictly 1 code max)", parse_mode="HTML", reply_markup=get_main_menu())
 
 @dp.callback_query(F.data == "add_proxies")
 async def cb_add_proxies(callback: types.CallbackQuery, state: FSMContext):
@@ -355,21 +360,21 @@ async def cb_start_automation(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     if not USER_DATA["firebase"] or not USER_DATA["codes"]:
-        await callback.answer("❌ Please configure Firebase and add referral codes first!", show_alert=True)
+        await callback.answer("❌ Please configure Firebase and add your 1 refer code first!", show_alert=True)
         return
 
     firebase_url = USER_DATA["firebase"]
-    codes = USER_DATA["codes"]
-    needed_per_code = 2
-    total_needed = len(codes) * needed_per_code
+    current_code = USER_DATA["codes"][0]
+    total_needed = 2  # Exactly 2 refers required for the 1 code
 
-    status_msg = await callback.message.answer(f"🚀 <b>Automation started!</b> Target Needed: {total_needed} registrations", parse_mode="HTML")
+    status_msg = await callback.message.answer(f"🚀 <b>Automation started!</b> Target Needed: exactly 2 registrations for code <code>{current_code}</code>", parse_mode="HTML")
     success_count = 0
+    registered_numbers = []
     skipped_phones = set()
     used_phones = set()
     logger = LiveLogger(status_msg)
 
-    # Strictly continue scanning until exact quota is met
+    # Strictly continue scanning until exact quota (2 registrations) is met
     while success_count < total_needed:
         import aiohttp
         online_targets = []
@@ -407,9 +412,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
         cid = target["cid"]
         phone = target["phone"]
         used_phones.add(phone)
-
-        code_idx = success_count // needed_per_code
-        current_code = codes[code_idx] if code_idx < len(codes) else codes[-1]
 
         await logger.set_text(f"🎯 Processing Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
 
@@ -465,6 +467,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         if v_res == "SUCCESS":
             success_count += 1
             skipped_phones.add(phone)
+            registered_numbers.append(phone)
             await logger.set_text(f"✅ SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
         else:
             skipped_phones.add(phone)
@@ -472,7 +475,17 @@ async def cb_start_automation(callback: types.CallbackQuery):
         await client.close()
         await asyncio.sleep(1.5)
 
-    await callback.message.answer(f"🎉 <b>REGISTRATION PROCESS COMPLETED! Successful: {success_count}/{total_needed}</b>", parse_mode="HTML", reply_markup=get_main_menu())
+    # Format the exact registered numbers list output
+    numbers_list_str = "\n".join([f"• <code>{num}</code>" for num in registered_numbers])
+    final_msg = (
+        f"🎉 <b>REGISTRATION PROCESS COMPLETED!</b> 🎉\n"
+        f"━━━━━━━━━━━━━━━━━━━━\n"
+        f"🟢 <b>Online Devices Detected:</b> {total_online_count}\n"
+        f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
+        f"📱 <b>Exact Registered Numbers:</b>\n{numbers_list_str}\n"
+        f"━━━━━━━━━━━━━━━━━━━━"
+    )
+    await callback.message.answer(final_msg, parse_mode="HTML", reply_markup=get_main_menu())
     await callback.answer()
 
 async def main():
