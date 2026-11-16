@@ -8,13 +8,16 @@ import random
 import json
 import gc
 
-import requests
+import aiohttp
 from curl_cffi.requests import AsyncSession
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.filters import CommandStart
 from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.context import FSMContext
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ==============================================================================
 # ⚙️ CONFIGURATION & SECURITY
@@ -28,8 +31,20 @@ TIMEOUT = 30
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
+# In-memory storage for session configurations
+USER_DATA = {
+    "firebase": None,
+    "codes": [],
+    "proxies": []
+}
+
+class Form(StatesGroup):
+    waiting_for_firebase = State()
+    waiting_for_codes = State()
+    waiting_for_proxies = State()
+
 # ==============================================================================
-# 🛒 HERO11 ASYNC CLIENT ENGINE
+# 🛒 HERO11 ASYNC CLIENT ENGINE & HELPERS
 # ==============================================================================
 def parse_firebase_link(link: str):
     link = link.strip()
@@ -46,22 +61,9 @@ def extract_phone(messages_dict):
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
 
-def load_proxies():
-    proxy_file = "proxies.txt"
-    proxies = []
-    if os.path.exists(proxy_file):
-        with open(proxy_file, "r", encoding="utf-8") as f:
-            for line in f:
-                p = line.strip()
-                if p and not p.startswith("#"):
-                    proxies.append(p)
-    return proxies
-
-PROXIES_LIST = load_proxies()
-
 def get_random_proxy():
-    if PROXIES_LIST:
-        return random.choice(PROXIES_LIST)
+    if USER_DATA["proxies"]:
+        return random.choice(USER_DATA["proxies"])
     return None
 
 class AsyncHero11Client:
@@ -205,8 +207,18 @@ class AsyncHero11Client:
         return "INVALID"
 
 # ==============================================================================
-# 🤖 TELEGRAM BOT DISPATCHER & LIVE LOGGING
+# 🤖 TELEGRAM KEYBOARDS & INTERACTIVE MENUS
 # ==============================================================================
+def get_main_menu():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔗 Add Firebase", callback_data="add_firebase"),
+         InlineKeyboardButton(text="📝 Add Refer Code", callback_data="add_codes")],
+        [InlineKeyboardButton(text="🌐 Add Proxies (HTTP)", callback_data="add_proxies"),
+         InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices")],
+        [InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
+        [InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
+    ])
+
 class LiveLogger:
     def __init__(self, message: types.Message):
         self.message = message
@@ -219,44 +231,138 @@ class LiveLogger:
         now = time.time()
         if force or (now - self.last_update > 1.0):
             try:
-                await self.message.edit_text(f"<code>{text}</code>", parse_mode="HTML")
+                await self.message.edit_text(f"<code>{text}</code>", parse_mode="HTML", reply_markup=get_main_menu())
                 self.last_update = time.time()
                 self.last_text = text
             except Exception:
                 pass
 
 @dp.message(CommandStart())
-async def cmd_start(message: types.Message):
+async def cmd_start(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    await message.answer("👋 <b>Welcome Admin!</b>\n\nSend your Firebase RTDB link followed by referral codes (one code per line).")
+    await state.clear()
+    text = (
+        "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
+        f"🔗 <b>Firebase:</b> {'Configured ✅' if USER_DATA['firebase'] else 'Not Set ❌'}\n"
+        f"📝 <b>Refer Codes:</b> {len(USER_DATA['codes'])} loaded\n"
+        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded\n\n"
+        "Select an option below:"
+    )
+    await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
 
-@dp.message(F.text)
-async def process_inputs(message: types.Message):
+@dp.callback_query(F.data == "add_firebase")
+async def cb_add_firebase(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(Form.waiting_for_firebase)
+    await callback.message.answer("🔗 Please send your Firebase RTDB link now:")
+    await callback.answer()
+
+@dp.message(Form.waiting_for_firebase)
+async def process_firebase_input(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
+    parsed = parse_firebase_link(message.text)
+    if not parsed:
+        await message.answer("❌ Invalid Firebase URL. Try again:")
+        return
+    USER_DATA["firebase"] = parsed
+    await state.clear()
+    await message.answer(f"✅ Firebase saved successfully!\n<code>{parsed}</code>", parse_mode="HTML", reply_markup=get_main_menu())
 
-    lines = [line.strip() for line in message.text.split("\n") if line.strip()]
-    if not lines:
-        await message.answer("❌ No input provided.")
+@dp.callback_query(F.data == "add_codes")
+async def cb_add_codes(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(Form.waiting_for_codes)
+    await callback.message.answer("📝 Please send your referral codes (one code per line):")
+    await callback.answer()
+
+@dp.message(Form.waiting_for_codes)
+async def process_codes_input(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    new_codes = [c.strip().upper() for c in message.text.split("\n") if c.strip()]
+    USER_DATA["codes"].extend(new_codes)
+    await state.clear()
+    await message.answer(f"✅ Added {len(new_codes)} codes! Total loaded: {len(USER_DATA['codes'])}", reply_markup=get_main_menu())
+
+@dp.callback_query(F.data == "add_proxies")
+async def cb_add_proxies(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(Form.waiting_for_proxies)
+    await callback.message.answer("🌐 Please send your HTTP proxies (one per line, format: `http://ip:port` or `http://user:pass@ip:port`):")
+    await callback.answer()
+
+@dp.message(Form.waiting_for_proxies)
+async def process_proxies_input(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    new_proxies = [p.strip() for p in message.text.split("\n") if p.strip() and p.startswith("http")]
+    USER_DATA["proxies"].extend(new_proxies)
+    await state.clear()
+    await message.answer(f"✅ Added {len(new_proxies)} HTTP proxies! Total loaded: {len(USER_DATA['proxies'])}", reply_markup=get_main_menu())
+
+@dp.callback_query(F.data == "check_devices")
+async def cb_check_devices(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    if not USER_DATA["firebase"]:
+        await callback.answer("❌ Please add a Firebase link first!", show_alert=True)
         return
 
-    firebase_url = parse_firebase_link(lines[0])
-    if not firebase_url:
-        await message.answer("❌ First line must be a valid Firebase database URL.")
+    await callback.message.answer("🔍 Scanning Firebase database for online devices...")
+    try:
+        online_count = 0
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f"{USER_DATA['firebase']}clients.json", timeout=10) as r:
+                clients_data = await r.json() or {}
+                for cid, cdata in clients_data.items():
+                    if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                        online_count += 1
+        await callback.message.answer(f"🟢 <b>Exact Online Devices Count:</b> {online_count}", parse_mode="HTML", reply_markup=get_main_menu())
+    except Exception as e:
+        await callback.message.answer(f"❌ Error checking devices: {e}", reply_markup=get_main_menu())
+    await callback.answer()
+
+@dp.callback_query(F.data == "check_proxies")
+async def cb_check_proxies(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    if not USER_DATA["proxies"]:
+        await callback.answer("❌ No proxies loaded!", show_alert=True)
         return
 
-    codes = [c.upper() for c in lines[1:] if c]
-    if not codes:
-        await message.answer("❌ Please provide at least one referral code below the Firebase link.")
+    status_msg = await callback.message.answer(f"⚡ Testing {len(USER_DATA['proxies'])} proxies...")
+    working = 0
+    async with aiohttp.ClientSession() as session:
+        for p in USER_DATA["proxies"]:
+            try:
+                async with session.get("https://httpbin.org/ip", proxy=p, timeout=5) as r:
+                    if r.status == 200:
+                        working += 1
+            except Exception:
+                pass
+    await status_msg.edit_text(f"⚡ Proxy Health Check Complete!\n🟢 Working Proxies: {working}/{len(USER_DATA['proxies'])}", reply_markup=get_main_menu())
+    await callback.answer()
+
+@dp.callback_query(F.data == "start_automation")
+async def cb_start_automation(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    if not USER_DATA["firebase"] or not USER_DATA["codes"]:
+        await callback.answer("❌ Please configure Firebase and add referral codes first!", show_alert=True)
         return
 
-    status_msg = await message.answer("🔍 <b>Connecting and counting online devices on Firebase...</b>")
-    
+    await callback.message.answer("🚀 <b>Automation started!</b> Scanning active clients...", parse_mode="HTML")
+    firebase_url = USER_DATA["firebase"]
+    codes = USER_DATA["codes"]
+
     online_targets = []
     total_online_count = 0
     try:
-        import aiohttp
         async with aiohttp.ClientSession() as session:
             async with session.get(f"{firebase_url}clients.json", timeout=10) as r:
                 clients_data = await r.json() or {}
@@ -275,22 +381,12 @@ async def process_inputs(message: types.Message):
                     except Exception:
                         pass
     except Exception as e:
-        await status_msg.edit_text(f"❌ Failed to connect to Firebase: {e}")
+        await callback.message.answer(f"❌ Failed to connect to Firebase: {e}")
         return
 
     needed_per_code = 2
     total_needed = len(codes) * needed_per_code
-
-    await status_msg.edit_text(
-        f"🔥 <b>Firebase Connected Successfully!</b>\n"
-        f"🟢 <b>Exact Online Devices Found: {total_online_count}</b>\n"
-        f"🎯 <b>Target Registrations Needed: {total_needed}</b>"
-    )
-
-    if not online_targets:
-        await message.answer("❌ No active online numbers found in this Firebase database.")
-        return
-
+    status_msg = await callback.message.answer(f"🔥 Online Devices Found: {total_online_count} | Target Needed: {total_needed}")
     success_count = 0
     skipped_phones = set()
     logger = LiveLogger(status_msg)
@@ -309,7 +405,6 @@ async def process_inputs(message: types.Message):
 
         await logger.set_text(f"🎯 Processing Phone: {phone} | Code: {current_code}\n⏳ Requesting OTP...")
 
-        import aiohttp
         async with aiohttp.ClientSession() as session:
             known_keys = set()
             try:
@@ -369,14 +464,8 @@ async def process_inputs(message: types.Message):
         await client.close()
         await asyncio.sleep(1.5)
 
-    final_msg = (
-        f"🎉 <b>REGISTRATION PROCESS COMPLETED!</b> 🎉\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 <b>Online Devices Detected:</b> {total_online_count}\n"
-        f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-    await message.answer(final_msg)
+    await callback.message.answer(f"🎉 <b>Automation Finished! Successful: {success_count}/{total_needed}</b>", parse_mode="HTML", reply_markup=get_main_menu())
+    await callback.answer()
 
 async def main():
     await bot.delete_webhook(drop_pending_updates=True)
