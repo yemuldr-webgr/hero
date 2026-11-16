@@ -284,9 +284,10 @@ def get_main_menu():
          InlineKeyboardButton(text="🗑️ Clear Firebase", callback_data="clear_firebase")],
         [InlineKeyboardButton(text="📝 Add Refer Code (Max 1)", callback_data="add_codes"),
          InlineKeyboardButton(text="🌐 Add Proxies (HTTP)", callback_data="add_proxies")],
-        [InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices"),
-         InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
-        [InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
+        [InlineKeyboardButton(text="🗑️ Clear Proxies", callback_data="clear_proxies"),
+         InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices")],
+        [InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies"),
+         InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
     ])
 
 class LiveLogger:
@@ -317,7 +318,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{current_code}</code>\n"
-        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded (Chrome-Impersonated Health Checker ⚡)\n\n"
+        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n\n"
         "Select an option below:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -348,6 +349,15 @@ async def cb_clear_firebase(callback: types.CallbackQuery):
         return
     USER_DATA["firebase_dbs"] = []
     await callback.message.answer("🗑️ <b>All Firebase databases cleared successfully!</b>", parse_mode="HTML", reply_markup=get_main_menu())
+    await callback.answer()
+
+@dp.callback_query(F.data == "clear_proxies")
+async def cb_clear_proxies(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    USER_DATA["proxies"] = []
+    USED_PROXIES.clear()
+    await callback.message.answer("🗑️ <b>All proxies cleared successfully!</b>", parse_mode="HTML", reply_markup=get_main_menu())
     await callback.answer()
 
 @dp.callback_query(F.data == "add_codes")
@@ -432,7 +442,6 @@ async def cb_check_proxies(callback: types.CallbackQuery):
     alive_count = 0
     total_proxies = len(USER_DATA['proxies'])
     
-    # Run concurrent health checking using ThreadPoolExecutor
     def run_tests():
         nonlocal alive_count
         alive_list = []
@@ -445,10 +454,7 @@ async def cb_check_proxies(callback: types.CallbackQuery):
                     alive_list.append(p)
         return alive_list
 
-    # Run in executor loop to avoid blocking telegram event loop
     alive_proxies = await asyncio.to_thread(run_tests)
-    
-    # Auto-filter and keep only live proxies in memory
     USER_DATA["proxies"] = alive_proxies
 
     await status_msg.edit_text(
