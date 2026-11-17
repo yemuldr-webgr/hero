@@ -83,7 +83,6 @@ def test_proxy_sync(proxy: str):
         err = str(e).split("See https")[0].strip()
         return False, time.time() - start, err, proxy
 
-# Track used proxies in current session to prevent IP reuse
 USED_PROXIES = set()
 
 def get_unique_proxy():
@@ -488,12 +487,12 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Enforcing proxy rotation & OTP pattern validation...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Target: 3 registrations for your code.", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
         current_code = USER_DATA["codes"][0]
-        total_needed = 2
+        total_needed = 3  # Strictly 3 referrals required
         success_count = 0
         registered_numbers = []
         skipped_phones = set()
