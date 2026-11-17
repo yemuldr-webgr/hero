@@ -25,10 +25,10 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # ==============================================================================
 BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"      # Apna Telegram Bot Token yahan dalein
 ADMIN_ID = 8337013809                      # Apna Admin User ID yahan dalein
-SOLVERIFY_API_KEY = "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg" # Solverify API Key (Used ONLY when Cloudflare blocks)
+SOLVERIFY_API_KEY = "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg" # Solverify API Key (Triggered automatically on Cloudflare challenges)
 OTP_TIMEOUT = 20                           # 20-second timeout as requested
 POLL_INTERVAL = 2
-TIMEOUT = 20
+TIMEOUT = 30
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -99,7 +99,7 @@ def get_unique_proxy():
 # 🧩 SELECTIVE SOLVERIFY TURNSTILE FALLBACK
 # ==============================================================================
 async def solve_cloudflare_turnstile(website_url: str, site_key: str, proxy: str = None) -> str:
-    """Called ONLY when Cloudflare blocks a request."""
+    """Called ONLY when Cloudflare blocks or challenges a request."""
     if not SOLVERIFY_API_KEY or SOLVERIFY_API_KEY == "YOUR_SOLVERIFY_API_KEY":
         return ""
 
@@ -250,12 +250,14 @@ class AsyncHero11Client:
                 method, url, json=data, headers=headers, impersonate="chrome", timeout=TIMEOUT
             )
             
-            # Selective trigger: Only invoke Solverify if Cloudflare challenge is encountered
-            if response.status_code in [403, 503] or "cf-chl" in response.text.lower():
+            # Catch Cloudflare challenges on ANY request (including OTP send & verification/login)
+            if response.status_code in [403, 503] or "cf-chl" in response.text.lower() or "cloudflare" in response.text.lower():
                 solved_token = await solve_cloudflare_turnstile(url, "0x4AAAAAAA...", self.proxy)
                 if solved_token:
                     self.cf_token = solved_token
                     headers["X-Cf-Token"] = solved_token
+                    if isinstance(data, dict):
+                        data["cfToken"] = solved_token
                     response = await self.session.request(
                         method, url, json=data, headers=headers, impersonate="chrome", timeout=TIMEOUT
                     )
@@ -575,10 +577,10 @@ async def cb_start_automation(callback: types.CallbackQuery):
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
         current_code = USER_DATA["codes"][0]
-        total_needed = 3  # Target set strictly to 3 valid referrals
+        total_needed = 3
         success_count = 0
         registered_numbers = []
-        skipped_phones = set()
+        skipped_phones = set()  # Permanently blacklists numbers that timeout or fail
         used_phones = set()
         logger = LiveLogger(status_msg)
 
@@ -654,7 +656,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                 db_short_id = firebase_url.split('//')[1].split('.')[0][:8]
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP (Rotated Proxy)...")
+                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
 
                 async with aiohttp.ClientSession() as session:
                     known_keys = set()
@@ -670,7 +672,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 send_status = await client.send_otp()
 
                 if send_status != "SUCCESS":
-                    skipped_phones.add(phone)
+                    skipped_phones.add(phone)  # Skip bad number permanently
                     await client.close()
                     continue
 
@@ -698,7 +700,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         pass
 
                 if not otp_found:
-                    skipped_phones.add(phone)
+                    skipped_phones.add(phone)  # Skip timed-out number permanently
                     await client.close()
                     continue
 
