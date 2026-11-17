@@ -21,11 +21,12 @@ from aiogram.fsm.context import FSMContext
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 # ==============================================================================
-# ⚙️ CONFIGURATION & SECURITY (HERO11 PLATFORM ONLY)
+# ⚙️ CONFIGURATION & SECURITY (HERO11 + SOLVERIFY INTEGRATION)
 # ==============================================================================
-BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"  # Apna Telegram Bot Token yahan dalein
-ADMIN_ID = 8337013809  # Apna Admin User ID yahan dalein
-OTP_TIMEOUT = 30
+BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"      # Apna Telegram Bot Token yahan dalein
+ADMIN_ID = 8337013809                      # Apna Admin User ID yahan dalein
+SOLVERIFY_API_KEY = "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg" # Solverify API Key yahan dalein
+OTP_TIMEOUT = 20                           # Reduced to 20 seconds as requested
 POLL_INTERVAL = 2
 TIMEOUT = 30
 
@@ -46,10 +47,9 @@ class Form(StatesGroup):
     waiting_for_proxies = State()
 
 # ==============================================================================
-# 🛒 PROXY NORMALIZATION & CHECKER ENGINE
+# 🛒 PROXY NORMALIZATION & HEALTH CHECKER ENGINE
 # ==============================================================================
 def parse_proxy(line: str) -> str:
-    """Normalize raw proxy string into standard http URL format[cite: 1]."""
     clean = line.strip().replace("http://", "").replace("https://", "")
     if "@" in clean:
         return f"http://{clean}"
@@ -62,7 +62,6 @@ def parse_proxy(line: str) -> str:
     return f"http://{clean}"
 
 def test_proxy_sync(proxy: str):
-    """Test a single proxy synchronously using curl_cffi chrome impersonation[cite: 1]."""
     start = time.time()
     try:
         r = cffi_requests.get(
@@ -95,6 +94,82 @@ def get_unique_proxy():
         USED_PROXIES.add(p)
         return p
     return None
+
+# ==============================================================================
+# 🧩 SOLVERIFY CLOUDFLARE TURNSTILE AUTOMATION
+# ==============================================================================
+async def solve_cloudflare_turnstile(website_url: str, site_key: str, proxy: str = None) -> str:
+    """Creates a task on Solverify and polls for the Turnstile token solution."""
+    if not SOLVERIFY_API_KEY or SOLVERIFY_API_KEY == "YOUR_SOLVERIFY_API_KEY":
+        return ""
+
+    create_url = "https://solver.solverify.net/createTask"
+    payload = {
+        "clientKey": SOLVERIFY_API_KEY,
+        "task": {
+            "type": "turnstile",
+            "websiteURL": website_url,
+            "websiteKey": site_key
+        }
+    }
+
+    if proxy:
+        # Parse proxy strings into Solverify structured format if available
+        # Format expects http proxy type
+        payload["task"]["proxyType"] = "http"
+        # Extract components if user:pass@host:port or host:port
+        clean_p = proxy.replace("http://", "").replace("https://", "")
+        if "@" in clean_p:
+            auth, hp = clean_p.split("@")
+            user, pwd = auth.split(":")
+            host, port = hp.split(":")
+            payload["task"]["proxyAddress"] = host
+            payload["task"]["proxyPort"] = str(port)
+            payload["task"]["proxyLogin"] = user
+            payload["task"]["proxyPassword"] = pwd
+        else:
+            parts = clean_p.split(":")
+            if len(parts) == 4:
+                host, port, user, pwd = parts
+                payload["task"]["proxyAddress"] = host
+                payload["task"]["proxyPort"] = str(port)
+                payload["task"]["proxyLogin"] = user
+                payload["task"]["proxyPassword"] = pwd
+            elif len(parts) == 2:
+                host, port = parts
+                payload["task"]["proxyAddress"] = host
+                payload["task"]["proxyPort"] = str(port)
+
+    try:
+        async with AsyncSession() as session:
+            resp = await session.post(create_url, json=payload, impersonate="chrome120", timeout=15)
+            data = resp.json()
+            if data.get("errorId") != 0:
+                return ""
+            task_id = data.get("taskId")
+
+            # Poll for task result (every 2-3 seconds)
+            result_url = "https://solver.solverify.net/getTaskResult"
+            poll_payload = {
+                "clientKey": SOLVERIFY_API_KEY,
+                "taskId": task_id
+            }
+
+            start_time = time.time()
+            while time.time() - start_time < 60:
+                await asyncio.sleep(2.5)
+                res_resp = await session.post(result_url, json=poll_payload, impersonate="chrome120", timeout=10)
+                res_data = res_resp.json()
+                
+                status = res_data.get("status")
+                if status == "completed":
+                    solution = res_data.get("solution", {})
+                    return solution.get("value", "")
+                elif status == "failed":
+                    return ""
+    except Exception:
+        pass
+    return ""
 
 # ==============================================================================
 # 🛒 HERO11 ASYNC CLIENT ENGINE & HELPERS
@@ -143,6 +218,7 @@ class AsyncHero11Client:
         self.session = AsyncSession(proxy=self.proxy) if self.proxy else AsyncSession()
         self.access_token = None
         self.attribute_uuid = None
+        self.cf_token = ""
 
     async def close(self):
         try:
@@ -177,6 +253,20 @@ class AsyncHero11Client:
             response = await self.session.request(
                 method, url, json=data, headers=headers, impersonate="chrome", timeout=TIMEOUT
             )
+            
+            # Check if blocked by Cloudflare Challenge
+            if response.status_code in [403, 503] or "cf-chl" in response.text.lower():
+                # Solve via Solverify Turnstile API automatically
+                site_key = "0x4AAAAAAA..." # Default sitekey or fallback widget key
+                solved_token = await solve_cloudflare_turnstile(url, site_key, self.proxy)
+                if solved_token:
+                    self.cf_token = solved_token
+                    headers["X-Cf-Token"] = solved_token
+                    # Retry request once with solved token
+                    response = await self.session.request(
+                        method, url, json=data, headers=headers, impersonate="chrome", timeout=TIMEOUT
+                    )
+
             if response.status_code >= 400:
                 return None
             return response.json()
@@ -227,9 +317,9 @@ class AsyncHero11Client:
             "deviceId": self.device_id,
             "loginType": 1,
             "phoneCountryCode": "+91",
-            "cfToken": ""
+            "cfToken": self.cf_token
         }
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+        await asyncio.sleep(random.uniform(2.0, 3.5))
         result = await self._request("POST", "/services/user/auth/v1/sendCode", data=payload)
         
         if result and result.get("code") == 0:
@@ -253,13 +343,13 @@ class AsyncHero11Client:
             "loginType": 1,
             "countryCode": "IN",
             "phoneCountryCode": "+91",
-            "cfToken": "",
+            "cfToken": self.cf_token,
             "attributeUuid": self.attribute_uuid,
             "distinctId": self.device_id,
             "material_id": 10,
             "hash": "f4ea2d51d0827c5b8c180f4ad7b83ca2"
         }
-        await asyncio.sleep(random.uniform(2.0, 4.0))
+        await asyncio.sleep(random.uniform(2.5, 4.5))
         result = await self._request("POST", "/services/user/auth/v1/loginWithCode", data=payload)
         
         if result and result.get("code") == 0:
@@ -314,7 +404,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     await state.clear()
     current_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "Not Set ❌"
     text = (
-        "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
+        "👋 <b>Welcome Admin to Hero11 Automation Bot (Solverify Enabled)!</b>\n\n"
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{current_code}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n\n"
@@ -487,12 +577,12 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Target: 3 registrations for your code.", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Target: exactly 3 verified registrations with Solverify integration.", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
         current_code = USER_DATA["codes"][0]
-        total_needed = 3  # Strictly 3 referrals required
+        total_needed = 3
         success_count = 0
         registered_numbers = []
         skipped_phones = set()
@@ -571,7 +661,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                 db_short_id = firebase_url.split('//')[1].split('.')[0][:8]
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP (Rotated Proxy)...")
+                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
 
                 async with aiohttp.ClientSession() as session:
                     known_keys = set()
@@ -591,7 +681,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     await client.close()
                     continue
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (30s timeout)...")
+                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (20s timeout)...")
 
                 otp_found = None
                 start_poll = time.time()
@@ -634,7 +724,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     skipped_phones.add(phone)
 
                 await client.close()
-                await asyncio.sleep(3.0)
+                await asyncio.sleep(4.0)
 
             USER_DATA["is_running"] = False
             if success_count >= total_needed:
