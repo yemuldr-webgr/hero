@@ -7,6 +7,7 @@ import uuid
 import random
 import json
 import gc
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from curl_cffi import requests as cffi_requests
@@ -190,37 +191,55 @@ def extract_phone(messages_dict):
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
 
+def parse_time_str(time_str):
+    """Parses human-readable time strings like '05:01 AM' or '04:55 PM' into minutes from midnight."""
+    try:
+        time_str = time_str.strip().upper()
+        match = re.search(r'(\d{1,2}):(\d{2})\s*(AM|PM)', time_str)
+        if match:
+            h, m, period = int(match.group(1)), int(match.group(2)), match.group(3)
+            if period == "PM" and h != 12:
+                h += 12
+            if period == "AM" and h == 12:
+                h = 0
+            return h * 60 + m
+    except Exception:
+        pass
+    return None
+
 def has_5min_window_otp_pattern(messages_dict, bot_start_epoch):
     """
-    Checks the exact 5-minute window leading up to bot start (e.g., 10:05 to 10:10 if started at 10:10).
+    Checks the exact 5-minute window leading up to bot start (e.g., 10:50 to 10:55).
     Evaluates up to the 5 most recent unpinned messages (skipping top 2 pinned items) within that window.
     """
     if not isinstance(messages_dict, dict):
         return False
     
     msg_items = list(messages_dict.items())
-    # Skip top 2 pinned/sticky messages, evaluate the recent unpinned messages
+    # Skip top 2 pinned/sticky messages, evaluate recent unpinned messages
     unpinned_items = msg_items[2:] if len(msg_items) > 2 else msg_items
     recent_five = unpinned_items[-5:] if len(unpinned_items) >= 5 else unpinned_items
     
-    window_start_epoch = bot_start_epoch - 300  # Exact 5-minute window (300 seconds prior to bot start)
-    
+    bot_dt = datetime.fromtimestamp(bot_start_epoch)
+    bot_minutes = bot_dt.hour * 60 + bot_dt.minute
+    window_start_minutes = bot_minutes - 5  # 5 minutes prior window
+
     valid_otp_count = 0
     for _, msg_val in recent_five:
         if isinstance(msg_val, dict):
-            # Check message timestamp or fallback to evaluation if timestamp format varies
-            msg_time = msg_val.get("timestamp") or msg_val.get("time") or bot_start_epoch
-            try:
-                msg_epoch = float(msg_time) / 1000.0 if float(msg_time) > 1e12 else float(msg_time)
-            except Exception:
-                msg_epoch = bot_start_epoch
-
-            # Must fall within the 5-minute window up to present start time
-            if window_start_epoch <= msg_epoch <= bot_start_epoch:
-                txt = str(msg_val.get("body") or msg_val.get("message") or "")
-                otps = re.findall(r'\b(\d{6})\b', txt)
-                valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
-                if valid_otps:
+            txt = str(msg_val.get("body") or msg_val.get("message") or "")
+            time_field = str(msg_val.get("time") or msg_val.get("timestamp") or "")
+            
+            otps = re.findall(r'\b(\d{6})\b', txt)
+            valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
+            
+            if valid_otps:
+                msg_minutes = parse_time_str(time_field)
+                if msg_minutes is not None:
+                    if window_start_minutes <= msg_minutes <= bot_minutes:
+                        valid_otp_count += 1
+                else:
+                    # Fallback if no string timestamp format is present
                     valid_otp_count += 1
                 
     return valid_otp_count > 0
@@ -600,7 +619,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    bot_start_epoch = time.time()  # Exact bot start timestamp (e.g. 10:10)
+    bot_start_epoch = time.time()  # Exact bot start timestamp anchoring (e.g., 10:55)
     status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Vetting active devices against the 5-minute window leading up to present...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
