@@ -8,7 +8,7 @@ import random
 import json
 import gc
 import html
-from datetime import datetime
+from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from curl_cffi import requests as cffi_requests
@@ -192,6 +192,58 @@ def extract_phone(messages_dict):
     text_data = str(messages_dict)
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
+
+def format_relative_time(time_str):
+    """
+    Parses timestamp strings like '19-11-2026 | 03:51:00 pm' or '10:46 PM' 
+    and converts them to relative format: 'xmin ago' or 'Xd ago'.
+    """
+    try:
+        time_str = str(time_str).strip().upper()
+        dt = None
+        
+        # Match DD-MM-YYYY | HH:MM:SS AM/PM or HH:MM AM/PM
+        dt_match = re.search(r'(\d{2})-(\d{2})-(\d{4})\s*\|\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
+        if dt_match:
+            d, m, y, h, mn, s, period = dt_match.groups()
+            hour = int(h)
+            if period == "PM" and hour != 12:
+                hour += 12
+            if period == "AM" and hour == 12:
+                hour = 0
+            sec = int(s) if s else 0
+            dt = datetime(int(y), int(m), int(d), hour, int(mn), sec)
+        else:
+            t_match = re.search(r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
+            if t_match:
+                h, mn, s, period = t_match.groups()
+                hour = int(h)
+                if period == "PM" and hour != 12:
+                    hour += 12
+                if period == "AM" and hour == 12:
+                    hour = 0
+                sec = int(s) if s else 0
+                now = datetime.now()
+                dt = datetime(now.year, now.month, now.day, hour, int(mn), sec)
+
+        if dt:
+            diff = datetime.now() - dt
+            total_seconds = int(diff.total_seconds())
+            
+            if total_seconds < 0:
+                return "Just now"
+            
+            days = total_seconds // 86400
+            if days >= 1:
+                return f"{days}d ago"
+            
+            minutes = total_seconds // 60
+            if minutes < 1:
+                return "1min ago"
+            return f"{minutes}min ago"
+    except Exception:
+        pass
+    return time_str
 
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
@@ -661,7 +713,8 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
                 if isinstance(msgs, dict):
                     for m_key, m_val in msgs.items():
                         if isinstance(m_val, dict):
-                            time_str = str(m_val.get("time") or m_val.get("timestamp") or "N/A")
+                            raw_time = str(m_val.get("time") or m_val.get("timestamp") or "N/A")
+                            time_str = format_relative_time(raw_time)
                             body_str = str(m_val.get("body") or m_val.get("message") or "N/A")
                             sms_list.append(f"• <b>[{html.escape(time_str)}]</b> {html.escape(body_str)}")
 
@@ -907,7 +960,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
             USER_DATA["is_running"] = False
         except Exception as e:
             USER_DATA["is_running"] = False
-            await callback.message.answer(f"❌ Error in automation loop: {html.escape(str(e))}", reply_markup=get_main_menu())
+            await callback.message.answer(f"❌ Error in automation loop: {html.escape(str(e))}", parse_mode="HTML", reply_markup=get_main_menu())
 
     USER_DATA["current_task"] = asyncio.create_task(run_automation())
     await callback.answer()
