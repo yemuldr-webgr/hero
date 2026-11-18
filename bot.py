@@ -46,6 +46,7 @@ class Form(StatesGroup):
     waiting_for_firebase = State()
     waiting_for_codes = State()
     waiting_for_proxies = State()
+    waiting_for_check_numbers = State()
 
 # ==============================================================================
 # 🛒 PROXY NORMALIZATION & HEALTH CHECKER ENGINE
@@ -190,37 +191,6 @@ def extract_phone(messages_dict):
     text_data = str(messages_dict)
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
-
-def get_latest_message_timestamp(messages_dict):
-    """
-    Scans the most recent 10 messages, filters spam, detects valid 6-digit OTPs,
-    and returns a recency score favoring messages closer to the end of the list.
-    """
-    if not isinstance(messages_dict, dict):
-        return 0
-    
-    msg_items = list(messages_dict.items())
-    recent_ten = msg_items[-10:] if len(msg_items) >= 10 else msg_items
-    
-    latest_score = 0
-    for index, (_, msg_val) in enumerate(recent_ten):
-        if isinstance(msg_val, dict):
-            txt = str(msg_val.get("body") or msg_val.get("message") or "")
-            
-            # Skip promotional spam
-            if "FREE OTP PANNELS" in txt.upper() or "JOIN TELEGRAM" in txt.upper():
-                continue
-            
-            # Strict 6-digit OTP check
-            otps = re.findall(r'\b\d{6}\b', txt)
-            valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
-            
-            if valid_otps:
-                score = (index + 1) * 1000
-                if score > latest_score:
-                    latest_score = score
-                    
-    return latest_score
 
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
@@ -378,8 +348,6 @@ class AsyncHero11Client:
             if user_info and user_info.get("isRestricted") is True:
                 return "IP_LIMITED"
             return "SUCCESS"
-        else:
-            print(f"[-] Verify API Response for {self.phone}: {result}")
         return "INVALID"
 
 # ==============================================================================
@@ -397,8 +365,9 @@ def get_main_menu():
          InlineKeyboardButton(text="🌐 Add Proxies (HTTP)", callback_data="add_proxies")],
         [InlineKeyboardButton(text="🗑️ Clear Proxies", callback_data="clear_proxies"),
          InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices")],
-        [InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies"),
-         InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
+        [InlineKeyboardButton(text="📊 Check Number Status", callback_data="check_numbers_menu"),
+         InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
+        [InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
     ])
 
 class LiveLogger:
@@ -540,6 +509,60 @@ async def cb_check_devices(callback: types.CallbackQuery):
         await callback.message.answer(f"❌ Error checking devices: {e}", reply_markup=get_main_menu())
     await callback.answer()
 
+@dp.callback_query(F.data == "check_numbers_menu")
+async def cb_check_numbers_menu(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    await state.set_state(Form.waiting_for_check_numbers)
+    await callback.message.answer(
+        "📊 <b>Number Registration Checker</b>\n\n"
+        "Please send phone number(s) to check (single or multiple, line by line, with or without +91):"
+    )
+    await callback.answer()
+
+@dp.message(Form.waiting_for_check_numbers)
+async def process_check_numbers_input(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    
+    raw_text = message.text.strip()
+    lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
+    if not lines:
+        await message.answer("❌ No valid numbers provided. Try again:")
+        return
+
+    status_msg = await message.answer(f"🔍 Checking registration status for {len(lines)} number(s)...")
+    
+    results = []
+    default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
+    
+    for line in lines:
+        digits = re.sub(r'[^0-9]', '', line)
+        if len(digits) >= 10:
+            phone_num = "+91" + digits[-10:]
+            clean_acc = digits[-10:]
+            
+            client = AsyncHero11Client(phone_num, default_code)
+            try:
+                check_res = await client.black_check()
+                if check_res == "SKIP_EXISTS":
+                    results.append(f"• <code>{phone_num}</code>: 🔴 <b>Already Registered</b>")
+                else:
+                    results.append(f"• <code>{phone_num}</code>: 🟢 <b>Unregistered / Available</b>")
+            except Exception:
+                results.append(f"• <code>{phone_num}</code>: ⚠️ Error checking")
+            await client.close()
+        else:
+            results.append(f"• <code>{line}</code>: ❌ Invalid Number format")
+
+    await state.clear()
+    report_str = "\n".join(results)
+    await status_msg.edit_text(
+        f"📊 <b>Number Checker Results:</b>\n\n{report_str}",
+        parse_mode="HTML",
+        reply_markup=get_main_menu()
+    )
+
 @dp.callback_query(F.data == "check_proxies")
 async def cb_check_proxies(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -599,7 +622,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Ranking active devices by recency...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Targeting live online unregistered devices...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -628,37 +651,29 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     if cid not in skipped_phones and cid not in used_phones:
                                         try:
-                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as m_req:
+                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=5', timeout=5) as m_req:
                                                 msgs = await m_req.json()
                                                 phone = extract_phone(msgs) if msgs else None
                                                 if phone:
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
-                                                        
-                                                        recency_score = get_latest_message_timestamp(msgs)
-                                                        if recency_score > 0:
-                                                            all_unregistered_candidates.append({
-                                                                "firebase_url": fb_url,
-                                                                "db_short_id": db_short_id,
-                                                                "cid": cid,
-                                                                "phone": full_phone,
-                                                                "recency_score": recency_score
-                                                            })
-                                                        else:
-                                                            skipped_phones.add(full_phone)
+                                                        all_unregistered_candidates.append({
+                                                            "firebase_url": fb_url,
+                                                            "db_short_id": db_short_id,
+                                                            "cid": cid,
+                                                            "phone": full_phone
+                                                        })
                                         except Exception:
                                             pass
                         except Exception:
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Bulk scan complete: No active unregistered devices with OTP patterns found. Retrying in 5s...")
+                    await logger.set_text("🔴 Bulk scan complete: No online unregistered devices found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
-                all_unregistered_candidates.sort(key=lambda x: x["recency_score"], reverse=True)
-
-                target = all_unregistered_candidates[0]
+                target = random.choice(all_unregistered_candidates)
                 firebase_url = target["firebase_url"]
                 db_short_id = target["db_short_id"]
                 cid = target["cid"]
@@ -715,7 +730,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                 await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | OTP Found: {otp_found}\n🔄 Forcing registration & verification...")
 
-                # --- AGGRESSIVE VERIFICATION RETRY LOOP (NO GIVING UP ON SUCCESSFUL OTP) ---
                 v_res = "INVALID"
                 for attempt in range(5):
                     v_res = await client.verify_otp(otp_found)
@@ -769,7 +783,7 @@ async def main():
 
 if __name__ == "__main__":
     if sys.platform.startswith('win'):
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+        asyncio.set_event_loop_policy(sys.WindowsSelectorEventLoopPolicy())
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
