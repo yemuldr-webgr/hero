@@ -195,13 +195,19 @@ def extract_phone(messages_dict):
 
 def format_relative_time(time_str):
     """
-    Parses timestamp strings like '19-11-2026 | 03:51:00 pm' or '10:46 PM' 
-    and converts them to relative format: 'Xm ago', 'Xh ago', or 'Xd ago'.
+    Parses timestamp strings and converts them to:
+    - Seconds: 'Xs ago'
+    - Minutes: 'Xm ago'
+    - Hours: 'Xh ago'
+    - Days: 'Xd ago'
+    Falls back gracefully if the timestamp is missing instead of showing N/A.
     """
     try:
         time_str = str(time_str).strip().upper()
+        if not time_str or time_str == "N/A" or time_str == "NONE":
+            return "Just now"
+            
         dt = None
-        
         dt_match = re.search(r'(\d{2})-(\d{2})-(\d{4})\s*\|\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
         if dt_match:
             d, m, y, h, mn, s, period = dt_match.groups()
@@ -242,11 +248,11 @@ def format_relative_time(time_str):
             
             minutes = total_seconds // 60
             if minutes < 1:
-                return "1m ago"
+                return f"{total_seconds}s ago"
             return f"{minutes}m ago"
     except Exception:
         pass
-    return time_str
+    return "Just now"
 
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
@@ -731,7 +737,6 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
 
         sms_block = "\n\n".join(sms_list) if sms_list else "<i>No messages found</i>"
         
-        # Unique timestamp query param to guarantee message content changes slightly on refresh
         cache_buster = int(time.time())
         detail_text = (
             f"<b>LATEST SMS — {html.escape(cid)} (latest 15)</b>\n"
