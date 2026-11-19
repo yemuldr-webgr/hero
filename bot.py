@@ -5,8 +5,6 @@ import re
 import time
 import uuid
 import random
-import json
-import gc
 import html
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -25,23 +23,28 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # ==============================================================================
 # ⚙️ CONFIGURATION & SECURITY (HERO11 PLATFORM ONLY)
 # ==============================================================================
-BOT_TOKEN = "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM"      # Apna Telegram Bot Token yahan dalein
-ADMIN_ID = 8337013809                      # Apna Admin User ID yahan dalein
-SOLVERIFY_API_KEY = "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg" # Solverify API Key (Triggered automatically on Cloudflare challenges)
-OTP_TIMEOUT = 25                           # Extended timeout for guaranteed arrival
+BOT_TOKEN = os.getenv("BOT_TOKEN", "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM").strip()
+ADMIN_ID = int(os.getenv("ADMIN_ID", "8337013809"))
+SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg").strip()
+OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
 TIMEOUT = 30
 IST = timezone(timedelta(hours=5, minutes=30))
+
+if not BOT_TOKEN or BOT_TOKEN == "ENTER_YOUR_BOT_TOKEN_HERE" or ":" not in BOT_TOKEN:
+    print("❌ Invalid or missing BOT_TOKEN. Set BOT_TOKEN in Railway Variables.")
+    sys.exit(1)
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
 USER_DATA = {
     "firebase_dbs": [],
-    "codes": [],  # Max length enforced to 1
+    "codes": [],
     "proxies": [],
     "is_running": False,
-    "current_task": None
+    "current_task": None,
+    "temp_active_devices": {},
 }
 
 class Form(StatesGroup):
@@ -103,7 +106,6 @@ def get_unique_proxy():
 # 🧩 SELECTIVE SOLVERIFY TURNSTILE FALLBACK
 # ==============================================================================
 async def solve_cloudflare_turnstile(website_url: str, site_key: str, proxy: str = None) -> str:
-    """Called ONLY when Cloudflare blocks or challenges a request."""
     if not SOLVERIFY_API_KEY or SOLVERIFY_API_KEY == "YOUR_SOLVERIFY_API_KEY":
         return ""
 
@@ -160,7 +162,6 @@ async def solve_cloudflare_turnstile(website_url: str, site_key: str, proxy: str
                 await asyncio.sleep(2.5)
                 res_resp = await session.post(result_url, json=poll_payload, impersonate="chrome120", timeout=10)
                 res_data = res_resp.json()
-                
                 status = res_data.get("status")
                 if status == "completed":
                     solution = res_data.get("solution", {})
@@ -197,7 +198,6 @@ def extract_phone(messages_dict):
 PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
 
 def decode_firebase_push_id(push_id: str):
-    """Extracts IST datetime from a Firebase push key (e.g. -O8x...)."""
     try:
         if not isinstance(push_id, str) or len(push_id) < 8:
             return None
@@ -214,10 +214,6 @@ def decode_firebase_push_id(push_id: str):
     return None
 
 def format_relative_time(time_val, msg_key: str = ""):
-    """
-    Parses Firebase timestamps (12h/24h strings, dates, epoch ms/s, or push keys)
-    anchored to IST and formats strictly as 'Xs ago', 'Xm ago', 'Xh ago', or 'Xd ago'.
-    """
     now_ist = datetime.now(IST)
     dt = None
 
@@ -288,15 +284,12 @@ def format_relative_time(time_val, msg_key: str = ""):
             days = diff_seconds // 86400
             if days >= 1:
                 return f"{days}d ago"
-
             hours = diff_seconds // 3600
             if hours >= 1:
                 return f"{hours}h ago"
-
             minutes = diff_seconds // 60
             if minutes >= 1:
                 return f"{minutes}m ago"
-
             return f"{diff_seconds}s ago"
 
     except Exception:
@@ -357,7 +350,6 @@ class AsyncHero11Client:
             response = await self.session.request(
                 method, url, json=data, headers=headers, impersonate="chrome", timeout=TIMEOUT
             )
-            
             if response.status_code in [403, 503] or "cf-chl" in response.text.lower() or "cloudflare" in response.text.lower():
                 solved_token = await solve_cloudflare_turnstile(url, "0x4AAAAAAA...", self.proxy)
                 if solved_token:
@@ -423,7 +415,6 @@ class AsyncHero11Client:
         }
         await asyncio.sleep(random.uniform(1.5, 3.0))
         result = await self._request("POST", "/services/user/auth/v1/sendCode", data=payload)
-        
         if result and result.get("code") == 0:
             return "SUCCESS"
         elif result and result.get("code") in [100005, 102018, 102017, 40007]:
@@ -433,7 +424,6 @@ class AsyncHero11Client:
     async def verify_otp(self, otp_code):
         if not self.attribute_uuid:
             self.attribute_uuid = str(uuid.uuid4())
-        
         clean_account = self.phone.replace("+91", "").lstrip("+")
         payload = {
             "account": clean_account,
@@ -453,7 +443,6 @@ class AsyncHero11Client:
         }
         await asyncio.sleep(random.uniform(1.0, 2.0))
         result = await self._request("POST", "/services/user/auth/v1/loginWithCode", data=payload)
-        
         if result and result.get("code") == 0:
             self.access_token = result.get("data", {}).get("accessToken")
             user_info = result.get("data", {}).get("user", {})
@@ -590,7 +579,6 @@ async def process_proxies_input(message: types.Message, state: FSMContext):
         line = line.strip()
         if line and not line.startswith("#"):
             new_proxies.append(parse_proxy(line))
-    
     USER_DATA["proxies"].extend(new_proxies)
     await state.clear()
     await message.answer(f"✅ Added {len(new_proxies)} normalized HTTP proxies! Total loaded: {len(USER_DATA['proxies'])}", parse_mode="HTML", reply_markup=get_main_menu())
@@ -637,7 +625,6 @@ async def cb_check_numbers_menu(callback: types.CallbackQuery, state: FSMContext
 async def process_check_numbers_input(message: types.Message, state: FSMContext):
     if message.from_user.id != ADMIN_ID:
         return
-    
     raw_text = message.text.strip()
     lines = [line.strip() for line in raw_text.split("\n") if line.strip()]
     if not lines:
@@ -645,15 +632,13 @@ async def process_check_numbers_input(message: types.Message, state: FSMContext)
         return
 
     status_msg = await message.answer(f"🔍 Checking registration status for {len(lines)} number(s)...")
-    
     results = []
     default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
-    
+
     for line in lines:
         digits = re.sub(r'[^0-9]', '', line)
         if len(digits) >= 10:
             phone_num = "+91" + digits[-10:]
-            
             client = AsyncHero11Client(phone_num, default_code)
             try:
                 check_res = await client.black_check()
@@ -663,14 +648,14 @@ async def process_check_numbers_input(message: types.Message, state: FSMContext)
                     results.append(f"• <code>{html.escape(phone_num)}</code>: 🟢 <b>Unregistered / Available</b>")
             except Exception:
                 results.append(f"• <code>{html.escape(phone_num)}</code>: ⚠️ Error checking")
-            await client.close()
+            finally:
+                await client.close()
         else:
             results.append(f"• <code>{html.escape(line)}</code>: ❌ Invalid Number format")
 
     await state.clear()
-    report_str = "\n".join(results)
     await status_msg.edit_text(
-        f"📊 <b>Number Checker Results:</b>\n\n{report_str}",
+        f"📊 <b>Number Checker Results:</b>\n\n" + "\n".join(results),
         parse_mode="HTML",
         reply_markup=get_main_menu()
     )
@@ -684,12 +669,12 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
         return
 
     status_msg = await callback.message.answer("🔍 Scanning online unregistered devices across all databases...")
-    
+
     try:
         import aiohttp
         active_devices = []
         default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
-        
+
         async with aiohttp.ClientSession() as session:
             for fb_url in USER_DATA["firebase_dbs"]:
                 db_short_id = fb_url.split('//')[1].split('.')[0][:8]
@@ -706,9 +691,10 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
                                     if phone:
                                         full_phone = "+91" + phone
                                         client = AsyncHero11Client(full_phone, default_code)
-                                        check_res = await client.black_check()
-                                        await client.close()
-                                        
+                                        try:
+                                            check_res = await client.black_check()
+                                        finally:
+                                            await client.close()
                                         if check_res != "SKIP_EXISTS":
                                             active_devices.append({
                                                 "phone": full_phone,
@@ -749,10 +735,10 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
 async def cb_show_device_sms(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
-    
+
     dev_map = USER_DATA.get("temp_active_devices", {})
     dev_info = dev_map.get(callback.data)
-    
+
     if not dev_info:
         await callback.answer("⚠️ Session expired or device list refreshed. Please click View Active Devices again.", show_alert=True)
         return
@@ -781,19 +767,17 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
                             time_ago = format_relative_time(raw_time, msg_key=m_key)
                             body_str = str(m_val.get("body") or m_val.get("message") or m_val.get("msg") or "N/A")
                             sender_str = str(m_val.get("sender") or m_val.get("address") or m_val.get("title") or "SMS")
-                            
+
                             otps = re.findall(r'\b\d{6}\b', body_str)
                             valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
-                            
                             otp_badge = f"  🔑 <b>OTP: {valid_otps[0]}</b>" if valid_otps else ""
-                            
+
                             sms_list.append(
                                 f"📤 <b>{html.escape(sender_str)}</b> • {html.escape(time_ago)}{otp_badge}\n"
                                 f"💬 {html.escape(body_str)}"
                             )
 
         sms_block = "\n\n".join(sms_list) if sms_list else "<i>No messages found</i>"
-        
         cache_buster = int(time.time())
         detail_text = (
             f"<b>LATEST SMS — {html.escape(cid)} (latest 15)</b>\n"
@@ -803,13 +787,12 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
             f"<span class='tg-spoiler'>[ref:{cache_buster}]</span>"
         )
 
-        refresh_callback = callback.data
         refresh_markup = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🔄 Refresh SMS History", callback_data=refresh_callback)],
+            [InlineKeyboardButton(text="🔄 Refresh SMS History", callback_data=callback.data)],
             [InlineKeyboardButton(text="⬅️ Back to Active Devices", callback_data="view_active_sms")],
             [InlineKeyboardButton(text="🏠 Main Menu", callback_data="back_to_main")]
         ])
-        
+
         try:
             await callback.message.edit_text(detail_text, parse_mode="HTML", reply_markup=refresh_markup)
             await callback.answer("Refreshed successfully!")
@@ -818,7 +801,7 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
                 await callback.answer("✅ SMS history is up to date!", show_alert=False)
             else:
                 raise edit_err
-                
+
     except Exception as e:
         await callback.message.edit_text(f"❌ Error fetching SMS history: {html.escape(str(e))}", reply_markup=get_main_menu())
         await callback.answer()
@@ -847,19 +830,15 @@ async def cb_check_proxies(callback: types.CallbackQuery):
         return
 
     status_msg = await callback.message.answer(f"⚡ Testing {len(USER_DATA['proxies'])} proxies concurrently using Chrome impersonation...")
-    
-    alive_count = 0
     total_proxies = len(USER_DATA['proxies'])
-    
+
     def run_tests():
-        nonlocal alive_count
         alive_list = []
         with ThreadPoolExecutor(max_workers=10) as executor:
             futures = {executor.submit(test_proxy_sync, p): p for p in USER_DATA["proxies"]}
             for future in as_completed(futures):
                 ok, latency, info, p = future.result()
                 if ok:
-                    alive_count += 1
                     alive_list.append(p)
         return alive_list
 
@@ -868,7 +847,7 @@ async def cb_check_proxies(callback: types.CallbackQuery):
 
     await status_msg.edit_text(
         f"⚡ <b>Proxy Health Check Complete!</b>\n"
-        f"🟢 <b>Alive & Fast Proxies:</b> {alive_count}/{total_proxies}\n"
+        f"🟢 <b>Alive & Fast Proxies:</b> {len(alive_proxies)}/{total_proxies}\n"
         f"💡 <i>Dead proxies have been automatically purged from memory.</i>",
         parse_mode="HTML",
         reply_markup=get_main_menu()
@@ -898,7 +877,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
     USER_DATA["is_running"] = True
     status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Targeting live online unregistered devices...", parse_mode="HTML", reply_markup=get_main_menu())
-    
+
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
         current_code = USER_DATA["codes"][0]
@@ -912,9 +891,8 @@ async def cb_start_automation(callback: types.CallbackQuery):
         try:
             while success_count < total_needed and USER_DATA["is_running"]:
                 import aiohttp
-                
                 all_unregistered_candidates = []
-                
+
                 async with aiohttp.ClientSession() as session:
                     for fb_url in firebase_dbs:
                         db_short_id = fb_url.split('//')[1].split('.')[0][:8]
@@ -968,65 +946,62 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         pass
 
                 client = AsyncHero11Client(phone, current_code)
-                send_status = await client.send_otp()
+                try:
+                    send_status = await client.send_otp()
+                    if send_status != "SUCCESS":
+                        skipped_phones.add(phone)
+                        continue
 
-                if send_status != "SUCCESS":
-                    skipped_phones.add(phone)
-                    await client.close()
-                    continue
+                    await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (25s timeout)...")
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (25s timeout)...")
+                    otp_found = None
+                    start_poll = time.time()
+                    while time.time() - start_poll < OTP_TIMEOUT and USER_DATA["is_running"]:
+                        await asyncio.sleep(POLL_INTERVAL)
+                        try:
+                            async with aiohttp.ClientSession() as session:
+                                async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as r:
+                                    msgs = await r.json()
+                                    if isinstance(msgs, dict):
+                                        for msg_key, msg_val in msgs.items():
+                                            if msg_key not in known_keys and isinstance(msg_val, dict):
+                                                txt = str(msg_val.get("body") or msg_val.get("message") or "")
+                                                for otp in re.findall(r'\b\d{6}\b', txt):
+                                                    if otp not in ["000000", "123456", "111111", "999999"]:
+                                                        otp_found = otp
+                                                        break
+                                        if otp_found:
+                                            break
+                        except Exception:
+                            pass
 
-                otp_found = None
-                start_poll = time.time()
-                while time.time() - start_poll < OTP_TIMEOUT and USER_DATA["is_running"]:
-                    await asyncio.sleep(POLL_INTERVAL)
-                    try:
-                        async with aiohttp.ClientSession() as session:
-                            async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as r:
-                                msgs = await r.json()
-                                if isinstance(msgs, dict):
-                                    for msg_key, msg_val in msgs.items():
-                                        if msg_key not in known_keys and isinstance(msg_val, dict):
-                                            txt = str(msg_val.get("body") or msg_val.get("message") or "")
-                                            for otp in re.findall(r'\b\d{6}\b', txt):
-                                                if otp not in ["000000", "123456", "111111", "999999"]:
-                                                    otp_found = otp
-                                                    break
-                                    if otp_found:
-                                        break
-                    except Exception:
-                        pass
+                    if not otp_found:
+                        skipped_phones.add(phone)
+                        continue
 
-                if not otp_found:
-                    skipped_phones.add(phone)
-                    await client.close()
-                    continue
+                    await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | OTP Found: {otp_found}\n🔄 Forcing registration & verification...")
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | OTP Found: {otp_found}\n🔄 Forcing registration & verification...")
+                    v_res = "INVALID"
+                    for _ in range(5):
+                        v_res = await client.verify_otp(otp_found)
+                        if v_res in ("SUCCESS", "IP_LIMITED"):
+                            break
+                        await asyncio.sleep(1.5)
 
-                v_res = "INVALID"
-                for attempt in range(5):
-                    v_res = await client.verify_otp(otp_found)
                     if v_res == "SUCCESS":
-                        break
+                        success_count += 1
+                        skipped_phones.add(phone)
+                        registered_numbers.append(f"{phone} (DB: {db_short_id})")
+                        await logger.set_text(f"✅ [DB: {db_short_id}] SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
                     elif v_res == "IP_LIMITED":
-                        break
-                    await asyncio.sleep(1.5)
+                        skipped_phones.add(phone)
+                        await logger.set_text("⚠️ IP Limited / Restricted by Hero11. Rotating proxy...")
+                    else:
+                        skipped_phones.add(phone)
+                        await logger.set_text(f"❌ Verification failed for {phone} after multiple attempts. Moving on...")
+                finally:
+                    await client.close()
 
-                if v_res == "SUCCESS":
-                    success_count += 1
-                    skipped_phones.add(phone)
-                    registered_numbers.append(f"{phone} (DB: {db_short_id})")
-                    await logger.set_text(f"✅ [DB: {db_short_id}] SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
-                elif v_res == "IP_LIMITED":
-                    skipped_phones.add(phone)
-                    await logger.set_text(f"⚠️ IP Limited / Restricted by Hero11. Rotating proxy...")
-                else:
-                    skipped_phones.add(phone)
-                    await logger.set_text(f"❌ Verification failed for {phone} after multiple attempts. Moving on...")
-
-                await client.close()
                 await asyncio.sleep(3.0)
 
             USER_DATA["is_running"] = False
@@ -1059,9 +1034,13 @@ async def main():
 if __name__ == "__main__":
     if sys.platform.startswith('win'):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\n\n❌ Bot stopped.")
-        sys.exit(0)
-```[cite: 6]
+    while True:
+        try:
+            asyncio.run(main())
+            break
+        except KeyboardInterrupt:
+            print("\n\n❌ Bot stopped.")
+            sys.exit(0)
+        except Exception as exc:
+            print(f"⚠️ Polling loop interrupted: {exc}. Restarting in 5s...")
+            time.sleep(5)
