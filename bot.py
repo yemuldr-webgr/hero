@@ -33,6 +33,10 @@ POLL_INTERVAL = 2
 TIMEOUT = 30
 IST = timezone(timedelta(hours=5, minutes=30))
 
+# India Location Coordinates (Pune / India reference)
+INDIA_LAT = 18.5011468
+INDIA_LON = 73.9242248
+
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -215,7 +219,7 @@ def decode_firebase_push_id(push_id: str):
 
 def format_relative_time(time_val, msg_key: str = ""):
     """
-    Accurately parses Firebase timestamps (explicit strings, epoch ms/s, or Firebase push keys)
+    Accurately parses Firebase timestamps (explicit strings, 12h/24h, epoch ms/s, or push keys)
     anchored to IST and converts them to true relative units: 'Xs ago', 'Xm ago', 'Xh ago', 'Xd ago'.
     """
     now_ist = datetime.now(IST)
@@ -228,13 +232,15 @@ def format_relative_time(time_val, msg_key: str = ""):
                 dt = datetime.fromtimestamp(val, tz=IST)
             else:
                 time_str = str(time_val).strip().upper()
-                if time_str.replace('.', '', 1).isdigit():
+                if time_str.replace(".", "", 1).isdigit():
                     val = float(time_str)
                     val = val / 1000.0 if val > 100000000000 else val
                     dt = datetime.fromtimestamp(val, tz=IST)
                 else:
-                    # Match DD-MM-YYYY | HH:MM:SS AM/PM or DD/MM/YYYY
-                    dt_match = re.search(r'(\d{1,2})[-/](\d{1,2})[-/](\d{4})\s*[\|,]?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?', time_str)
+                    dt_match = re.search(
+                        r'(\d{1,2})[-/](\d{1,2})[-/](\d{4})\s*[\|,@\s]+\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?',
+                        time_str,
+                    )
                     if dt_match:
                         d, m, y, h, mn, s, period = dt_match.groups()
                         hour = int(h)
@@ -245,15 +251,16 @@ def format_relative_time(time_val, msg_key: str = ""):
                         sec = int(s) if s else 0
                         dt = datetime(int(y), int(m), int(d), hour, int(mn), sec, tzinfo=IST)
                     else:
-                        # Match YYYY-MM-DD HH:MM:SS
-                        iso_match = re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?', time_str)
+                        iso_match = re.search(
+                            r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?',
+                            time_str,
+                        )
                         if iso_match:
                             y, m, d, h, mn, s = iso_match.groups()
                             sec = int(s) if s else 0
                             dt = datetime(int(y), int(m), int(d), int(h), int(mn), sec, tzinfo=IST)
                         else:
-                            # Match standalone HH:MM(:SS) AM/PM
-                            t_match = re.search(r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
+                            t_match = re.search(r'\b(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?\b', time_str)
                             if t_match:
                                 h, mn, s, period = t_match.groups()
                                 hour = int(h)
@@ -262,11 +269,13 @@ def format_relative_time(time_val, msg_key: str = ""):
                                 elif period == "AM" and hour == 12:
                                     hour = 0
                                 sec = int(s) if s else 0
-                                dt = datetime(now_ist.year, now_ist.month, now_ist.day, hour, int(mn), sec, tzinfo=IST)
-                                if dt > now_ist + timedelta(minutes=5):
-                                    dt -= timedelta(days=1)
+                                if 0 <= hour <= 23 and 0 <= int(mn) <= 59:
+                                    dt = datetime(
+                                        now_ist.year, now_ist.month, now_ist.day, hour, int(mn), sec, tzinfo=IST
+                                    )
+                                    if dt > now_ist + timedelta(minutes=2):
+                                        dt -= timedelta(days=1)
 
-        # Fallback: decode exact creation time from Firebase push key if time field wasn't present
         if dt is None and msg_key:
             dt = decode_firebase_push_id(msg_key)
 
@@ -275,10 +284,12 @@ def format_relative_time(time_val, msg_key: str = ""):
             total_seconds = int(diff.total_seconds())
 
             if total_seconds < 0:
-                # Handle slight clock skew up to 2 minutes gracefully; otherwise show raw string
-                if abs(total_seconds) <= 120:
-                    return "1s ago"
-                return str(time_val) if time_val and str(time_val) != "N/A" else dt.strftime("%d-%m %I:%M %p")
+                ahead_sec = abs(total_seconds)
+                if ahead_sec <= 60:
+                    return f"{max(1, ahead_sec)}s ago"
+                if ahead_sec <= 3600:
+                    return f"{max(1, ahead_sec // 60)}m ago"
+                return str(time_val) if time_val and str(time_val) != "N/A" else "Recent"
 
             days = total_seconds // 86400
             if days >= 1:
@@ -339,6 +350,8 @@ class AsyncHero11Client:
             "X-Lang": "en-US",
             "X-Site-Code": "hero11-in",
             "X-UI-Variant": "v2",
+            "X-Geo-Lat": str(INDIA_LAT),
+            "X-Geo-Lon": str(INDIA_LON),
             "Sec-Ch-Ua-Platform": '"Windows"',
             "Sec-Ch-Ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
             "Sec-Ch-Ua-Mobile": "?0",
