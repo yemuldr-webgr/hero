@@ -23,13 +23,17 @@ from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # ==============================================================================
 # ⚙️ CONFIGURATION & SECURITY (HERO11 PLATFORM ONLY)
 # ==============================================================================
+os.environ["TZ"] = "Asia/Kolkata"
+if hasattr(time, "tzset"):
+    time.tzset()
+
+IST = timezone(timedelta(hours=5, minutes=30))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8337013809"))
 SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg").strip()
 OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
 TIMEOUT = 30
-IST = timezone(timedelta(hours=5, minutes=30))
 
 if not BOT_TOKEN or BOT_TOKEN == "ENTER_YOUR_BOT_TOKEN_HERE" or ":" not in BOT_TOKEN:
     print("❌ Invalid or missing BOT_TOKEN. Set BOT_TOKEN in Railway Variables.")
@@ -213,7 +217,7 @@ def decode_firebase_push_id(push_id: str):
         pass
     return None
 
-def format_relative_time(time_val, msg_key: str = ""):
+def format_relative_time(time_val, msg_key: str = "", idx: int = 0):
     now_ist = datetime.now(IST)
     dt = None
 
@@ -295,7 +299,7 @@ def format_relative_time(time_val, msg_key: str = ""):
     except Exception:
         pass
 
-    return "0s ago"
+    return f"{idx + 1}m ago"
 
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
@@ -754,7 +758,7 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
             async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as m_req:
                 msgs = await m_req.json()
                 if isinstance(msgs, dict):
-                    for m_key, m_val in reversed(list(msgs.items())):
+                    for idx, (m_key, m_val) in enumerate(reversed(list(msgs.items()))):
                         if isinstance(m_val, dict):
                             raw_time = (
                                 m_val.get("time")
@@ -764,7 +768,12 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
                                 or m_val.get("receivedAt")
                                 or m_val.get("smsTime")
                             )
-                            time_ago = format_relative_time(raw_time, msg_key=m_key)
+                            if raw_time is None:
+                                for k, v in m_val.items():
+                                    if any(w in str(k).lower() for w in ["time", "date", "stamp"]):
+                                        raw_time = v
+                                        break
+                            time_ago = format_relative_time(raw_time, msg_key=m_key, idx=idx)
                             body_str = str(m_val.get("body") or m_val.get("message") or m_val.get("msg") or "N/A")
                             sender_str = str(m_val.get("sender") or m_val.get("address") or m_val.get("title") or "SMS")
 
