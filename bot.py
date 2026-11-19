@@ -8,7 +8,7 @@ import random
 import json
 import gc
 import html
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from curl_cffi import requests as cffi_requests
@@ -31,6 +31,7 @@ SOLVERIFY_API_KEY = "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DO
 OTP_TIMEOUT = 25                           # Extended timeout for guaranteed arrival
 POLL_INTERVAL = 2
 TIMEOUT = 30
+IST = timezone(timedelta(hours=5, minutes=30))
 
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
@@ -193,73 +194,110 @@ def extract_phone(messages_dict):
     match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return match.group(1) if match else None
 
-def format_relative_time(time_val):
-    """
-    Accurately parses Firebase timestamps (numerical epoch ms/s or strings) 
-    and converts them to true relative formats: 'Xs ago', 'Xm ago', 'Xh ago', 'Xd ago'.
-    """
+PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
+
+def decode_firebase_push_id(push_id: str):
+    """Extracts exact IST datetime from a 20-char Firebase push key (e.g. -O8x...)."""
     try:
-        if isinstance(time_val, (int, float)):
-            if time_val > 100000000000:
-                time_val = time_val / 1000.0
-            dt = datetime.fromtimestamp(time_val)
-        else:
-            time_str = str(time_val).strip().upper()
-            if not time_str or time_str in ["N/A", "NONE", "NULL"]:
-                return "Just now"
-            
-            if time_str.isdigit() or (time_str.replace('.', '', 1).isdigit()):
-                val = float(time_str)
-                if val > 100000000000:
-                    val = val / 1000.0
-                dt = datetime.fromtimestamp(val)
+        if not isinstance(push_id, str) or len(push_id) < 8:
+            return None
+        timestamp = 0
+        for char in push_id[:8]:
+            idx = PUSH_CHARS.find(char)
+            if idx == -1:
+                return None
+            timestamp = timestamp * 64 + idx
+        if timestamp > 1500000000000:
+            return datetime.fromtimestamp(timestamp / 1000.0, tz=IST)
+    except Exception:
+        pass
+    return None
+
+def format_relative_time(time_val, msg_key: str = ""):
+    """
+    Accurately parses Firebase timestamps (explicit strings, epoch ms/s, or Firebase push keys)
+    anchored to IST and converts them to true relative units: 'Xs ago', 'Xm ago', 'Xh ago', 'Xd ago'.
+    """
+    now_ist = datetime.now(IST)
+    dt = None
+
+    try:
+        if time_val is not None and str(time_val).strip().upper() not in ["", "N/A", "NONE", "NULL"]:
+            if isinstance(time_val, (int, float)):
+                val = time_val / 1000.0 if time_val > 100000000000 else time_val
+                dt = datetime.fromtimestamp(val, tz=IST)
             else:
-                dt = None
-                dt_match = re.search(r'(\d{2})-(\d{2})-(\d{4})\s*\|\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
-                if dt_match:
-                    d, m, y, h, mn, s, period = dt_match.groups()
-                    hour = int(h)
-                    if period == "PM" and hour != 12:
-                        hour += 12
-                    if period == "AM" and hour == 12:
-                        hour = 0
-                    sec = int(s) if s else 0
-                    dt = datetime(int(y), int(m), int(d), hour, int(mn), sec)
+                time_str = str(time_val).strip().upper()
+                if time_str.replace('.', '', 1).isdigit():
+                    val = float(time_str)
+                    val = val / 1000.0 if val > 100000000000 else val
+                    dt = datetime.fromtimestamp(val, tz=IST)
                 else:
-                    t_match = re.search(r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
-                    if t_match:
-                        h, mn, s, period = t_match.groups()
+                    # Match DD-MM-YYYY | HH:MM:SS AM/PM or DD/MM/YYYY
+                    dt_match = re.search(r'(\d{1,2})[-/](\d{1,2})[-/](\d{4})\s*[\|,]?\s*(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?', time_str)
+                    if dt_match:
+                        d, m, y, h, mn, s, period = dt_match.groups()
                         hour = int(h)
                         if period == "PM" and hour != 12:
                             hour += 12
-                        if period == "AM" and hour == 12:
+                        elif period == "AM" and hour == 12:
                             hour = 0
                         sec = int(s) if s else 0
-                        now = datetime.now()
-                        dt = datetime(now.year, now.month, now.day, hour, int(mn), sec)
+                        dt = datetime(int(y), int(m), int(d), hour, int(mn), sec, tzinfo=IST)
+                    else:
+                        # Match YYYY-MM-DD HH:MM:SS
+                        iso_match = re.search(r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?', time_str)
+                        if iso_match:
+                            y, m, d, h, mn, s = iso_match.groups()
+                            sec = int(s) if s else 0
+                            dt = datetime(int(y), int(m), int(d), int(h), int(mn), sec, tzinfo=IST)
+                        else:
+                            # Match standalone HH:MM(:SS) AM/PM
+                            t_match = re.search(r'(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)', time_str)
+                            if t_match:
+                                h, mn, s, period = t_match.groups()
+                                hour = int(h)
+                                if period == "PM" and hour != 12:
+                                    hour += 12
+                                elif period == "AM" and hour == 12:
+                                    hour = 0
+                                sec = int(s) if s else 0
+                                dt = datetime(now_ist.year, now_ist.month, now_ist.day, hour, int(mn), sec, tzinfo=IST)
+                                if dt > now_ist + timedelta(minutes=5):
+                                    dt -= timedelta(days=1)
 
-        if dt:
-            diff = datetime.now() - dt
+        # Fallback: decode exact creation time from Firebase push key if time field wasn't present
+        if dt is None and msg_key:
+            dt = decode_firebase_push_id(msg_key)
+
+        if dt is not None:
+            diff = now_ist - dt
             total_seconds = int(diff.total_seconds())
-            
+
             if total_seconds < 0:
-                return "Just now"
-            
+                # Handle slight clock skew up to 2 minutes gracefully; otherwise show raw string
+                if abs(total_seconds) <= 120:
+                    return "1s ago"
+                return str(time_val) if time_val and str(time_val) != "N/A" else dt.strftime("%d-%m %I:%M %p")
+
             days = total_seconds // 86400
             if days >= 1:
                 return f"{days}d ago"
-            
+
             hours = total_seconds // 3600
             if hours >= 1:
                 return f"{hours}h ago"
-            
+
             minutes = total_seconds // 60
-            if minutes < 1:
-                return f"{max(1, total_seconds)}s ago"
-            return f"{minutes}m ago"
+            if minutes >= 1:
+                return f"{minutes}m ago"
+
+            return f"{max(1, total_seconds)}s ago"
+
     except Exception:
         pass
-    return "Just now"
+
+    return str(time_val) if time_val and str(time_val) != "N/A" else "Recent"
 
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
@@ -727,10 +765,17 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
                 if isinstance(msgs, dict):
                     for m_key, m_val in reversed(list(msgs.items())):
                         if isinstance(m_val, dict):
-                            raw_time = m_val.get("time") or m_val.get("timestamp") or m_val.get("date") or "N/A"
-                            time_ago = format_relative_time(raw_time)
-                            body_str = str(m_val.get("body") or m_val.get("message") or "N/A")
-                            sender_str = str(m_val.get("sender") or m_val.get("title") or "SMS")
+                            raw_time = (
+                                m_val.get("time")
+                                or m_val.get("timestamp")
+                                or m_val.get("date")
+                                or m_val.get("created_at")
+                                or m_val.get("receivedAt")
+                                or m_val.get("smsTime")
+                            )
+                            time_ago = format_relative_time(raw_time, msg_key=m_key)
+                            body_str = str(m_val.get("body") or m_val.get("message") or m_val.get("msg") or "N/A")
+                            sender_str = str(m_val.get("sender") or m_val.get("address") or m_val.get("title") or "SMS")
                             
                             otps = re.findall(r'\b\d{6}\b', body_str)
                             valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
