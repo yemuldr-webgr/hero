@@ -28,6 +28,7 @@ if hasattr(time, "tzset"):
     time.tzset()
 
 IST = timezone(timedelta(hours=5, minutes=30))
+BOT_START_IST = datetime.now(IST)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8337013809"))
 SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg").strip()
@@ -211,7 +212,6 @@ def message_has_otp_pattern(msg_val) -> bool:
     if not body.strip():
         return False
 
-    # Explicit OTP / verification wording + digits, or any 4-8 digit standalone code
     has_keyword = bool(re.search(r'\b(?:otp|one[\s-]*time[\s-]*password|verification[\s-]*code|passcode|auth[\s-]*code)\b', body, re.IGNORECASE))
     codes = re.findall(r'\b\d{4,8}\b', body)
     filtered_codes = [c for c in codes if c not in {"0000", "1234", "000000", "123456", "111111", "999999", "00000000"}]
@@ -223,13 +223,6 @@ def message_has_otp_pattern(msg_val) -> bool:
     if any(len(c) == 6 for c in filtered_codes):
         return True
     return False
-
-def top5_has_otp_pattern(msgs) -> bool:
-    """Returns True if at least 1 of the top 5 most recent messages has an OTP pattern."""
-    if not isinstance(msgs, dict) or not msgs:
-        return False
-    top5_items = list(msgs.items())[-5:]
-    return any(message_has_otp_pattern(m_val) for _, m_val in top5_items)
 
 PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
 
@@ -249,8 +242,9 @@ def decode_firebase_push_id(push_id: str):
         pass
     return None
 
-def format_relative_time(time_val, msg_key: str = "", idx: int = 0):
-    now_ist = datetime.now(IST)
+def resolve_message_dt(time_val, msg_key: str = "", ref_now: datetime = None):
+    if ref_now is None:
+        ref_now = BOT_START_IST
     dt = None
 
     try:
@@ -301,11 +295,11 @@ def format_relative_time(time_val, msg_key: str = "", idx: int = 0):
                                 elif period == "AM" and hour == 12:
                                     hour = 0
                                 if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= sec <= 59:
-                                    dt = datetime(now_ist.year, now_ist.month, now_ist.day, hour, minute, sec, tzinfo=IST)
-                                    if dt > now_ist:
+                                    dt = datetime(ref_now.year, ref_now.month, ref_now.day, hour, minute, sec, tzinfo=IST)
+                                    if dt > ref_now:
                                         if period is None and hour <= 12 and (hour + 12) <= 23:
-                                            alt_dt = datetime(now_ist.year, now_ist.month, now_ist.day, hour + 12, minute, sec, tzinfo=IST)
-                                            if alt_dt <= now_ist:
+                                            alt_dt = datetime(ref_now.year, ref_now.month, ref_now.day, hour + 12, minute, sec, tzinfo=IST)
+                                            if alt_dt <= ref_now:
                                                 dt = alt_dt
                                             else:
                                                 dt -= timedelta(days=1)
@@ -315,21 +309,53 @@ def format_relative_time(time_val, msg_key: str = "", idx: int = 0):
         if dt is None and msg_key:
             dt = decode_firebase_push_id(msg_key)
 
-        if dt is not None:
-            diff_seconds = max(0, int((now_ist - dt).total_seconds()))
-            days = diff_seconds // 86400
-            if days >= 1:
-                return f"{days}d ago"
-            hours = diff_seconds // 3600
-            if hours >= 1:
-                return f"{hours}h ago"
-            minutes = diff_seconds // 60
-            if minutes >= 1:
-                return f"{minutes}m ago"
-            return f"{diff_seconds}s ago"
-
     except Exception:
         pass
+
+    return dt
+
+def has_otp_in_last_10m_from_start(msgs) -> bool:
+    """Returns True only if at least 1 message with an OTP pattern arrived within the last 10 minutes from BOT_START_IST."""
+    if not isinstance(msgs, dict) or not msgs:
+        return False
+    cutoff = BOT_START_IST - timedelta(minutes=10)
+    for m_key, m_val in msgs.items():
+        if not message_has_otp_pattern(m_val):
+            continue
+        raw_time = (
+            m_val.get("time")
+            or m_val.get("timestamp")
+            or m_val.get("date")
+            or m_val.get("created_at")
+            or m_val.get("receivedAt")
+            or m_val.get("smsTime")
+        )
+        if raw_time is None:
+            for k, v in m_val.items():
+                if any(w in str(k).lower() for w in ["time", "date", "stamp"]):
+                    raw_time = v
+                    break
+        msg_dt = resolve_message_dt(raw_time, msg_key=m_key, ref_now=BOT_START_IST)
+        if msg_dt is not None and cutoff <= msg_dt <= BOT_START_IST + timedelta(minutes=1):
+            return True
+    return False
+
+def format_relative_time(time_val, msg_key: str = "", idx: int = 0):
+    now_ist = datetime.now(IST)
+    dt = resolve_message_dt(time_val, msg_key=msg_key, ref_now=now_ist)
+
+    if dt is not None:
+        diff_seconds = max(0, int((now_ist - dt).total_seconds()))
+        days = diff_seconds // 86400
+        if days >= 1:
+            return f"{days}d ago"
+        hours = diff_seconds // 3600
+        if hours >= 1:
+            return f"{hours}h ago"
+        minutes = diff_seconds // 60
+        if minutes >= 1:
+            return f"{minutes}m ago"
+        return f"{diff_seconds}s ago"
 
     return f"{idx + 1}m ago"
 
@@ -1003,12 +1029,12 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>OTP-Active Scan Started!</b> Filtering unregistered numbers with >=1 OTP pattern in top 5 SMS...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>Scan Started!</b> Picking unregistered numbers with OTP pattern in last 10m from bot start...", parse_mode="HTML", reply_markup=get_main_menu())
 
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
         current_code = USER_DATA["codes"][0]
-        total_needed = 3
+        total_needed = 2
         success_count = 0
         registered_numbers = []
         skipped_phones = set()
@@ -1033,20 +1059,14 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                     continue
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     try:
-                                        async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=5', timeout=5) as m_req:
+                                        async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=5) as m_req:
                                             msgs = await m_req.json()
 
-                                        # Require at least 1 OTP pattern in the top 5 most recent messages
-                                        if not top5_has_otp_pattern(msgs):
+                                        if not has_otp_in_last_10m_from_start(msgs):
                                             skipped_cids.add(cid)
                                             continue
 
                                         phones = extract_all_phones(msgs)
-                                        if not phones:
-                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=5) as p_req:
-                                                p_msgs = await p_req.json()
-                                                phones = extract_all_phones(p_msgs)
-
                                         for phone in phones:
                                             full_phone = "+91" + phone
                                             if full_phone not in skipped_phones and full_phone not in used_phones:
@@ -1062,7 +1082,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Scan complete: No online unregistered devices with >=1 OTP pattern in top 5 SMS. Retrying in 5s...")
+                    await logger.set_text("🔴 Scan complete: No unregistered numbers with OTP pattern in last 10m from bot start. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
