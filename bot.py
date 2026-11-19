@@ -33,10 +33,6 @@ POLL_INTERVAL = 2
 TIMEOUT = 30
 IST = timezone(timedelta(hours=5, minutes=30))
 
-# India Location Coordinates (Pune / India reference)
-INDIA_LAT = 18.5011468
-INDIA_LON = 73.9242248
-
 bot = Bot(token=BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=MemoryStorage())
 
@@ -201,7 +197,7 @@ def extract_phone(messages_dict):
 PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
 
 def decode_firebase_push_id(push_id: str):
-    """Extracts exact IST datetime from a 20-char Firebase push key (e.g. -O8x...)."""
+    """Extracts IST datetime from a Firebase push key (e.g. -O8x...)."""
     try:
         if not isinstance(push_id, str) or len(push_id) < 8:
             return None
@@ -219,8 +215,8 @@ def decode_firebase_push_id(push_id: str):
 
 def format_relative_time(time_val, msg_key: str = ""):
     """
-    Accurately parses Firebase timestamps (explicit strings, 12h/24h, epoch ms/s, or push keys)
-    anchored to IST and converts them to true relative units: 'Xs ago', 'Xm ago', 'Xh ago', 'Xd ago'.
+    Parses Firebase timestamps (12h/24h strings, dates, epoch ms/s, or push keys)
+    anchored to IST and formats strictly as 'Xs ago', 'Xm ago', 'Xh ago', or 'Xd ago'.
     """
     now_ist = datetime.now(IST)
     dt = None
@@ -232,7 +228,7 @@ def format_relative_time(time_val, msg_key: str = ""):
                 dt = datetime.fromtimestamp(val, tz=IST)
             else:
                 time_str = str(time_val).strip().upper()
-                if time_str.replace(".", "", 1).isdigit():
+                if re.fullmatch(r'\d+(?:\.\d+)?', time_str):
                     val = float(time_str)
                     val = val / 1000.0 if val > 100000000000 else val
                     dt = datetime.fromtimestamp(val, tz=IST)
@@ -243,13 +239,14 @@ def format_relative_time(time_val, msg_key: str = ""):
                     )
                     if dt_match:
                         d, m, y, h, mn, s, period = dt_match.groups()
-                        hour = int(h)
+                        hour, minute = int(h), int(mn)
+                        sec = int(s) if s else 0
                         if period == "PM" and hour != 12:
                             hour += 12
                         elif period == "AM" and hour == 12:
                             hour = 0
-                        sec = int(s) if s else 0
-                        dt = datetime(int(y), int(m), int(d), hour, int(mn), sec, tzinfo=IST)
+                        if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= sec <= 59:
+                            dt = datetime(int(y), int(m), int(d), hour, minute, sec, tzinfo=IST)
                     else:
                         iso_match = re.search(
                             r'(\d{4})[-/](\d{1,2})[-/](\d{1,2})[T\s]+(\d{1,2}):(\d{2})(?::(\d{2}))?',
@@ -257,58 +254,55 @@ def format_relative_time(time_val, msg_key: str = ""):
                         )
                         if iso_match:
                             y, m, d, h, mn, s = iso_match.groups()
+                            hour, minute = int(h), int(mn)
                             sec = int(s) if s else 0
-                            dt = datetime(int(y), int(m), int(d), int(h), int(mn), sec, tzinfo=IST)
+                            if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= sec <= 59:
+                                dt = datetime(int(y), int(m), int(d), hour, minute, sec, tzinfo=IST)
                         else:
-                            t_match = re.search(r'\b(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?\b', time_str)
+                            t_match = re.search(r'(?<!\d)(\d{1,2}):(\d{2})(?::(\d{2}))?\s*(AM|PM)?(?!\d)', time_str)
                             if t_match:
                                 h, mn, s, period = t_match.groups()
-                                hour = int(h)
+                                hour, minute = int(h), int(mn)
+                                sec = int(s) if s else 0
                                 if period == "PM" and hour != 12:
                                     hour += 12
                                 elif period == "AM" and hour == 12:
                                     hour = 0
-                                sec = int(s) if s else 0
-                                if 0 <= hour <= 23 and 0 <= int(mn) <= 59:
-                                    dt = datetime(
-                                        now_ist.year, now_ist.month, now_ist.day, hour, int(mn), sec, tzinfo=IST
-                                    )
-                                    if dt > now_ist + timedelta(minutes=2):
-                                        dt -= timedelta(days=1)
+                                if 0 <= hour <= 23 and 0 <= minute <= 59 and 0 <= sec <= 59:
+                                    dt = datetime(now_ist.year, now_ist.month, now_ist.day, hour, minute, sec, tzinfo=IST)
+                                    if dt > now_ist:
+                                        if period is None and hour <= 12 and (hour + 12) <= 23:
+                                            alt_dt = datetime(now_ist.year, now_ist.month, now_ist.day, hour + 12, minute, sec, tzinfo=IST)
+                                            if alt_dt <= now_ist:
+                                                dt = alt_dt
+                                            else:
+                                                dt -= timedelta(days=1)
+                                        else:
+                                            dt -= timedelta(days=1)
 
         if dt is None and msg_key:
             dt = decode_firebase_push_id(msg_key)
 
         if dt is not None:
-            diff = now_ist - dt
-            total_seconds = int(diff.total_seconds())
-
-            if total_seconds < 0:
-                ahead_sec = abs(total_seconds)
-                if ahead_sec <= 60:
-                    return f"{max(1, ahead_sec)}s ago"
-                if ahead_sec <= 3600:
-                    return f"{max(1, ahead_sec // 60)}m ago"
-                return str(time_val) if time_val and str(time_val) != "N/A" else "Recent"
-
-            days = total_seconds // 86400
+            diff_seconds = max(0, int((now_ist - dt).total_seconds()))
+            days = diff_seconds // 86400
             if days >= 1:
                 return f"{days}d ago"
 
-            hours = total_seconds // 3600
+            hours = diff_seconds // 3600
             if hours >= 1:
                 return f"{hours}h ago"
 
-            minutes = total_seconds // 60
+            minutes = diff_seconds // 60
             if minutes >= 1:
                 return f"{minutes}m ago"
 
-            return f"{max(1, total_seconds)}s ago"
+            return f"{diff_seconds}s ago"
 
     except Exception:
         pass
 
-    return str(time_val) if time_val and str(time_val) != "N/A" else "Recent"
+    return "0s ago"
 
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
@@ -350,8 +344,6 @@ class AsyncHero11Client:
             "X-Lang": "en-US",
             "X-Site-Code": "hero11-in",
             "X-UI-Variant": "v2",
-            "X-Geo-Lat": str(INDIA_LAT),
-            "X-Geo-Lon": str(INDIA_LON),
             "Sec-Ch-Ua-Platform": '"Windows"',
             "Sec-Ch-Ua": '"Not-A.Brand";v="99", "Google Chrome";v="157", "Chromium";v="157"',
             "Sec-Ch-Ua-Mobile": "?0",
@@ -1072,3 +1064,4 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         print("\n\n❌ Bot stopped.")
         sys.exit(0)
+```[cite: 6]
