@@ -34,6 +34,8 @@ SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "RqHPFHbQCNwItxqfh21kDmH0Sx2b
 OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
 TIMEOUT = 20
+VERIFY_HTTP_TIMEOUT = 35
+MAX_FORCE_VERIFY_ATTEMPTS = 120
 SCAN_CHECK_TIMEOUT = 10
 BATCH_SIZE = 5
 TARGET_REGISTRATIONS = 2
@@ -551,7 +553,12 @@ class AsyncHero11Client:
             "hash": "f4ea2d51d0827c5b8c180f4ad7b83ca2"
         }
         await asyncio.sleep(random.uniform(1.0, 2.0))
-        result = await self._request("POST", "/services/user/auth/v1/loginWithCode", data=payload)
+        result = await self._request(
+            "POST",
+            "/services/user/auth/v1/loginWithCode",
+            data=payload,
+            req_timeout=VERIFY_HTTP_TIMEOUT,
+        )
         if result and result.get("code") == 0:
             self.access_token = result.get("data", {}).get("accessToken")
             user_info = result.get("data", {}).get("user", {})
@@ -1336,14 +1343,8 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                         otp_found = None
                         start_poll = time.time()
-                        while (
-                            time.time() - start_poll < OTP_TIMEOUT
-                            and USER_DATA["is_running"]
-                            and not cap_reached_event.is_set()
-                        ):
+                        while time.time() - start_poll < OTP_TIMEOUT and USER_DATA["is_running"]:
                             await asyncio.sleep(POLL_INTERVAL)
-                            if cap_reached_event.is_set():
-                                break
                             try:
                                 async with aiohttp.ClientSession() as session:
                                     async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as r:
@@ -1361,55 +1362,41 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             except Exception:
                                 pass
 
-                        if cap_reached_event.is_set():
-                            skipped_phones.add(phone)
-                            slot["status"] = "⏭️ Ignored (Cap 2/2)"
-                            slot["done"] = True
-                            await board.render(panel_name, batch_num, success_count, total_needed, slots)
-                            return
-
                         if not otp_found:
+                            if cap_reached_event.is_set():
+                                slot["status"] = "⏭️ Ignored (Cap 2/2)"
+                            else:
+                                slot["status"] = "❌ No OTP Arrived"
                             skipped_phones.add(phone)
-                            slot["status"] = "❌ No OTP Arrived"
                             slot["done"] = True
                             await board.render(panel_name, batch_num, success_count, total_needed, slots)
                             return
 
-                        async with state_lock:
-                            if success_count >= total_needed or cap_reached_event.is_set():
-                                cap_reached_event.set()
-                                skipped_phones.add(phone)
-                                slot["status"] = f"⏭️ OTP {otp_found} Ignored (Cap 2/2)"
-                                slot["done"] = True
-                                await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
-                                return
-
-                        slot["status"] = f"🔑 OTP {otp_found} • Verifying..."
-                        await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
-
+                        # OTP arrived: force register without a verification timeout
+                        attempt = 0
                         v_res = "INVALID"
-                        for _ in range(5):
-                            if cap_reached_event.is_set():
-                                break
+                        while USER_DATA["is_running"] and attempt < MAX_FORCE_VERIFY_ATTEMPTS:
+                            attempt += 1
+                            slot["status"] = f"🔑 OTP {otp_found} • Force Reg #{attempt}..."
+                            await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
                             v_res = await client.verify_otp(otp_found)
                             if v_res in ("SUCCESS", "IP_LIMITED"):
                                 break
-                            await asyncio.sleep(1.5)
+                            await asyncio.sleep(1.0)
 
                         async with state_lock:
-                            if v_res == "SUCCESS" and success_count < total_needed:
-                                success_count += 1
+                            if v_res == "SUCCESS":
                                 skipped_phones.add(phone)
                                 slot["ok"] = True
                                 slot["done"] = True
-                                slot["status"] = f"✅ Registered ({success_count}/{total_needed})"
-                                registered_numbers.append(f"{phone} (ID: {cid[:12]}, DB: {slot['db_short_id']})")
-                                if success_count >= total_needed:
-                                    cap_reached_event.set()
-                            elif cap_reached_event.is_set():
-                                skipped_phones.add(phone)
-                                slot["done"] = True
-                                slot["status"] = "⏭️ Ignored (Cap 2/2)"
+                                if success_count < total_needed:
+                                    success_count += 1
+                                    slot["status"] = f"✅ Force Registered ({success_count}/{total_needed})"
+                                    registered_numbers.append(f"{phone} (ID: {cid[:12]}, DB: {slot['db_short_id']})")
+                                    if success_count >= total_needed:
+                                        cap_reached_event.set()
+                                else:
+                                    slot["status"] = "✅ Force Registered (Extra)"
                             elif v_res == "IP_LIMITED":
                                 skipped_phones.add(phone)
                                 slot["done"] = True
@@ -1417,7 +1404,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             else:
                                 skipped_phones.add(phone)
                                 slot["done"] = True
-                                slot["status"] = "❌ Verify Failed"
+                                slot["status"] = "❌ Force Reg Stopped"
 
                         await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
                     finally:
