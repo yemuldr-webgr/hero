@@ -379,6 +379,7 @@ class AsyncHero11Client:
         self.access_token = None
         self.attribute_uuid = None
         self.cf_token = ""
+        self.last_error_kind = None
 
     async def close(self):
         try:
@@ -386,9 +387,23 @@ class AsyncHero11Client:
         except Exception:
             pass
 
+    @staticmethod
+    def _classify_response_ip_problem(status_code: int, raw_text: str, json_data: dict = None) -> bool:
+        if status_code in (403, 429, 503):
+            return True
+        low_text = (raw_text or "").lower()
+        if any(k in low_text for k in ("cf-chl", "cloudflare", "ip limit", "ip restricted", "too many requests", "rate limit", "proxy")):
+            return True
+        if isinstance(json_data, dict):
+            msg = str(json_data.get("msg") or json_data.get("message") or "").lower()
+            if any(k in msg for k in ("ip limit", "ip restricted", "too many", "rate limit", "frequent", "proxy")):
+                return True
+        return False
+
     async def _request(self, method, path, data=None, req_timeout: int = None):
         url = self.BASE_URL + path
         effective_timeout = req_timeout or TIMEOUT
+        self.last_error_kind = None
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -414,10 +429,11 @@ class AsyncHero11Client:
             response = await self.session.request(
                 method, url, json=data, headers=headers, impersonate="chrome", timeout=effective_timeout
             )
+            raw_txt = response.text or ""
             if not self.fast_check and (
                 response.status_code in [403, 503]
-                or "cf-chl" in response.text.lower()
-                or "cloudflare" in response.text.lower()
+                or "cf-chl" in raw_txt.lower()
+                or "cloudflare" in raw_txt.lower()
             ):
                 solved_token = await solve_cloudflare_turnstile(url, "0x4AAAAAAA...", self.proxy)
                 if solved_token:
@@ -428,11 +444,25 @@ class AsyncHero11Client:
                     response = await self.session.request(
                         method, url, json=data, headers=headers, impersonate="chrome", timeout=effective_timeout
                     )
+                    raw_txt = response.text or ""
 
             if response.status_code >= 400:
+                if self._classify_response_ip_problem(response.status_code, raw_txt):
+                    self.last_error_kind = "IP_PROBLEM"
+                else:
+                    self.last_error_kind = "SEND_FAILED"
                 return None
-            return response.json()
-        except Exception:
+
+            parsed = response.json()
+            if self._classify_response_ip_problem(response.status_code, raw_txt, parsed):
+                self.last_error_kind = "IP_PROBLEM"
+            return parsed
+        except Exception as exc:
+            err_low = str(exc).lower()
+            if self.proxy and any(k in err_low for k in ("proxy", "connect", "timed out", "timeout", "ssl", "407")):
+                self.last_error_kind = "IP_PROBLEM"
+            else:
+                self.last_error_kind = "SEND_FAILED"
             return None
 
     async def pre_bind(self):
@@ -494,9 +524,11 @@ class AsyncHero11Client:
         result = await self._request("POST", "/services/user/auth/v1/sendCode", data=payload)
         if result and result.get("code") == 0:
             return "SUCCESS"
-        elif result and result.get("code") in [100005, 102018, 102017, 40007]:
+        if result and result.get("code") in [100005, 102018, 102017, 40007]:
             return "SKIP_EXISTS"
-        return "FAILED"
+        if self.last_error_kind == "IP_PROBLEM":
+            return "IP_PROBLEM"
+        return "SEND_FAILED"
 
     async def verify_otp(self, otp_code):
         if not self.attribute_uuid:
@@ -558,7 +590,7 @@ async def collect_grouped_unregistered_devices(
 ):
     """
     Fast parallel scanner for ALL online devices (`status == True`) grouped per unique device ID (`cid`)
-    containing ONLY unregistered numbers (no time-window filtering).
+    containing ONLY unregistered numbers.
     """
     import aiohttp
     skipped_cids = skipped_cids or set()
@@ -1278,9 +1310,23 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             slot["done"] = True
                             return
 
+                        if send_status == "SKIP_EXISTS":
+                            skipped_phones.add(phone)
+                            slot["status"] = "❌ Already Registered"
+                            slot["done"] = True
+                            await board.render(panel_name, batch_num, success_count, total_needed, slots)
+                            return
+
+                        if send_status == "IP_PROBLEM":
+                            skipped_phones.add(phone)
+                            slot["status"] = "⚠️ IP Problem"
+                            slot["done"] = True
+                            await board.render(panel_name, batch_num, success_count, total_needed, slots)
+                            return
+
                         if send_status != "SUCCESS":
                             skipped_phones.add(phone)
-                            slot["status"] = "❌ Registered / Send Failed"
+                            slot["status"] = "❌ OTP Sending Failed"
                             slot["done"] = True
                             await board.render(panel_name, batch_num, success_count, total_needed, slots)
                             return
@@ -1367,7 +1413,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             elif v_res == "IP_LIMITED":
                                 skipped_phones.add(phone)
                                 slot["done"] = True
-                                slot["status"] = "⚠️ IP Limited"
+                                slot["status"] = "⚠️ IP Problem"
                             else:
                                 skipped_phones.add(phone)
                                 slot["done"] = True
