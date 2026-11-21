@@ -35,10 +35,10 @@ OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
 TIMEOUT = 20
 VERIFY_HTTP_TIMEOUT = 35
-MAX_FORCE_VERIFY_ATTEMPTS = 120
 SCAN_CHECK_TIMEOUT = 10
 BATCH_SIZE = 5
 TARGET_REGISTRATIONS = 2
+MAX_BATCHES = 3
 
 if not BOT_TOKEN or BOT_TOKEN == "ENTER_YOUR_BOT_TOKEN_HERE" or ":" not in BOT_TOKEN:
     print("❌ Invalid or missing BOT_TOKEN. Set BOT_TOKEN in Railway Variables.")
@@ -373,7 +373,7 @@ class AsyncHero11Client:
             elif len(digits) >= 10:
                 self.phone = "+91" + digits[-10:]
         
-        self.invite_code = invite_code
+        self.invite_code = invite_code.strip()
         self.device_id = uuid.uuid4().hex
         self.fast_check = fast_check
         self.proxy = get_unique_proxy()
@@ -382,12 +382,18 @@ class AsyncHero11Client:
         self.attribute_uuid = None
         self.cf_token = ""
         self.last_error_kind = None
+        self.last_api_msg = ""
 
     async def close(self):
         try:
             await self.session.close()
         except Exception:
             pass
+
+    async def rotate_session(self):
+        await self.close()
+        self.proxy = get_unique_proxy()
+        self.session = AsyncSession(proxy=self.proxy) if self.proxy else AsyncSession()
 
     @staticmethod
     def _classify_response_ip_problem(status_code: int, raw_text: str, json_data: dict = None) -> bool:
@@ -406,6 +412,7 @@ class AsyncHero11Client:
         url = self.BASE_URL + path
         effective_timeout = req_timeout or TIMEOUT
         self.last_error_kind = None
+        self.last_api_msg = ""
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -452,10 +459,12 @@ class AsyncHero11Client:
                 if self._classify_response_ip_problem(response.status_code, raw_txt):
                     self.last_error_kind = "IP_PROBLEM"
                 else:
-                    self.last_error_kind = "SEND_FAILED"
+                    self.last_error_kind = "NETWORK_ERROR"
                 return None
 
             parsed = response.json()
+            if isinstance(parsed, dict):
+                self.last_api_msg = str(parsed.get("msg") or parsed.get("message") or "")
             if self._classify_response_ip_problem(response.status_code, raw_txt, parsed):
                 self.last_error_kind = "IP_PROBLEM"
             return parsed
@@ -464,10 +473,17 @@ class AsyncHero11Client:
             if self.proxy and any(k in err_low for k in ("proxy", "connect", "timed out", "timeout", "ssl", "407")):
                 self.last_error_kind = "IP_PROBLEM"
             else:
-                self.last_error_kind = "SEND_FAILED"
+                self.last_error_kind = "NETWORK_ERROR"
             return None
 
-    async def pre_bind(self):
+    async def pre_bind(self) -> bool:
+        """
+        Strictly binds inviteCode on Hero11 and requires a real server-issued attributeUuid.
+        Never fabricates a fake local UUID if attributionLink fails, preventing unattributed/fake referrals.
+        """
+        if not self.invite_code or self.invite_code == "DEFAULT":
+            return False
+
         payload = {
             "inviteCode": self.invite_code,
             "device": "pc",
@@ -476,13 +492,17 @@ class AsyncHero11Client:
             "use_type": 1,
             "materialId": 10
         }
-        await asyncio.sleep(random.uniform(1.2, 2.5))
-        result = await self._request("POST", "/services/user/attribution/v1/attributionLink", data=payload)
-        if result and "data" in result and isinstance(result.get("data"), dict):
-            self.attribute_uuid = result.get("data", {}).get("uuid") or str(uuid.uuid4())
-        else:
-            self.attribute_uuid = str(uuid.uuid4())
-        return True
+        for attempt in range(3):
+            await asyncio.sleep(random.uniform(0.8, 1.6))
+            result = await self._request("POST", "/services/user/attribution/v1/attributionLink", data=payload)
+            if isinstance(result, dict) and result.get("code") == 0:
+                data_obj = result.get("data")
+                if isinstance(data_obj, dict) and data_obj.get("uuid"):
+                    self.attribute_uuid = str(data_obj["uuid"]).strip()
+                    return True
+            if attempt < 2 and USER_DATA["proxies"]:
+                await self.rotate_session()
+        return False
 
     async def black_check(self):
         clean_account = self.phone.replace("+91", "").lstrip("+")
@@ -495,7 +515,7 @@ class AsyncHero11Client:
         if self.fast_check:
             await asyncio.sleep(random.uniform(0.1, 0.25))
         else:
-            await asyncio.sleep(random.uniform(0.8, 1.5))
+            await asyncio.sleep(random.uniform(0.5, 1.0))
 
         result = await self._request(
             "POST",
@@ -503,17 +523,31 @@ class AsyncHero11Client:
             data=payload,
             req_timeout=SCAN_CHECK_TIMEOUT if self.fast_check else TIMEOUT,
         )
-        if result and "data" in result and isinstance(result.get("data"), dict):
-            if result["data"].get("isNew") == 2:
-                return "SKIP_EXISTS"
+        if not isinstance(result, dict) or result.get("code") != 0:
+            if self.last_error_kind == "IP_PROBLEM":
+                return "IP_PROBLEM"
+            return "CHECK_FAILED"
+        data_obj = result.get("data")
+        if isinstance(data_obj, dict) and data_obj.get("isNew") == 2:
+            return "SKIP_EXISTS"
         return "SUCCESS"
 
     async def send_otp(self):
-        await self.pre_bind()
+        # 1. Must bind referral attribution first—abort if attribution fails so no fake/unreferred signup happens
+        bound = await self.pre_bind()
+        if not bound or not self.attribute_uuid:
+            if self.last_error_kind == "IP_PROBLEM":
+                return "IP_PROBLEM"
+            return "ATTRIBUTION_FAILED"
+
+        # 2. Verify number is genuinely unregistered
         check = await self.black_check()
         if check == "SKIP_EXISTS":
             return "SKIP_EXISTS"
+        if check != "SUCCESS":
+            return check
 
+        # 3. Request OTP
         clean_account = self.phone.replace("+91", "").lstrip("+")
         payload = {
             "account": clean_account,
@@ -522,11 +556,11 @@ class AsyncHero11Client:
             "phoneCountryCode": "+91",
             "cfToken": self.cf_token
         }
-        await asyncio.sleep(random.uniform(1.5, 3.0))
+        await asyncio.sleep(random.uniform(1.0, 2.0))
         result = await self._request("POST", "/services/user/auth/v1/sendCode", data=payload)
-        if result and result.get("code") == 0:
+        if isinstance(result, dict) and result.get("code") == 0:
             return "SUCCESS"
-        if result and result.get("code") in [100005, 102018, 102017, 40007]:
+        if isinstance(result, dict) and result.get("code") in [100005, 102018, 102017, 40007]:
             return "SKIP_EXISTS"
         if self.last_error_kind == "IP_PROBLEM":
             return "IP_PROBLEM"
@@ -534,7 +568,7 @@ class AsyncHero11Client:
 
     async def verify_otp(self, otp_code):
         if not self.attribute_uuid:
-            self.attribute_uuid = str(uuid.uuid4())
+            return "ATTRIBUTION_FAILED"
         clean_account = self.phone.replace("+91", "").lstrip("+")
         payload = {
             "account": clean_account,
@@ -552,20 +586,37 @@ class AsyncHero11Client:
             "material_id": 10,
             "hash": "f4ea2d51d0827c5b8c180f4ad7b83ca2"
         }
-        await asyncio.sleep(random.uniform(1.0, 2.0))
+        await asyncio.sleep(random.uniform(0.6, 1.2))
         result = await self._request(
             "POST",
             "/services/user/auth/v1/loginWithCode",
             data=payload,
             req_timeout=VERIFY_HTTP_TIMEOUT,
         )
-        if result and result.get("code") == 0:
-            self.access_token = result.get("data", {}).get("accessToken")
-            user_info = result.get("data", {}).get("user", {})
-            if user_info and user_info.get("isRestricted") is True:
+        if not isinstance(result, dict):
+            return "NETWORK_RETRY"
+
+        code = result.get("code")
+        if code == 0:
+            data_obj = result.get("data") or {}
+            token = data_obj.get("accessToken")
+            user_info = data_obj.get("user") or {}
+            if not token:
+                return "REJECTED_OTP"
+            if user_info.get("isRestricted") is True:
                 return "IP_LIMITED"
+            # Confirm account was actually created as a new referral (isNew != 2)
+            if data_obj.get("isNew") == 2 or user_info.get("isNew") == 2:
+                return "ALREADY_EXISTS"
+            self.access_token = token
             return "SUCCESS"
-        return "INVALID"
+
+        if self.last_error_kind == "IP_PROBLEM":
+            return "IP_LIMITED"
+        if code in [100005, 102018, 102017, 40007]:
+            return "ALREADY_EXISTS"
+        # Explicit API rejection (wrong/expired OTP) — don't loop forever on a rejected code
+        return "REJECTED_OTP"
 
 async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache: dict, concurrency: int = 20):
     """Checks registration status for multiple +91 numbers concurrently."""
@@ -577,9 +628,12 @@ async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache:
             client = AsyncHero11Client(full_phone, invite_code, fast_check=True)
             try:
                 res = await client.black_check()
-                reg_cache[full_phone] = (res != "SKIP_EXISTS")
+                if res == "SUCCESS":
+                    reg_cache[full_phone] = True
+                elif res == "SKIP_EXISTS":
+                    reg_cache[full_phone] = False
             except Exception:
-                reg_cache[full_phone] = False
+                pass
             finally:
                 await client.close()
 
@@ -597,7 +651,7 @@ async def collect_grouped_unregistered_devices(
 ):
     """
     Fast parallel scanner for ALL online devices (`status == True`) grouped per unique device ID (`cid`)
-    containing ONLY unregistered numbers.
+    containing ONLY verified unregistered numbers.
     """
     import aiohttp
     skipped_cids = skipped_cids or set()
@@ -672,13 +726,15 @@ async def collect_grouped_unregistered_devices(
     for d in raw_device_entries:
         unreg_phones = []
         for full_phone in d["candidate_phones"]:
-            if reg_cache.get(full_phone):
+            status = reg_cache.get(full_phone)
+            if status is True:
                 unreg_phones.append(full_phone)
-            else:
+            elif status is False:
                 skipped_phones.add(full_phone)
 
         if not unreg_phones:
-            skipped_cids.add(d["cid"])
+            if all(reg_cache.get(p) is False for p in d["candidate_phones"]):
+                skipped_cids.add(d["cid"])
             continue
 
         grouped_results.append({
@@ -739,7 +795,7 @@ class BatchBoardLogger:
 
         rows_text = "\n".join(rows) if rows else "<i>Scanning all unregistered online devices...</i>"
         board = (
-            f"⚡ <b>HERO11 AUTO BATCH REGISTRATION (BATCH #{batch_num})</b>\n\n"
+            f"⚡ <b>HERO11 AUTO BATCH REGISTRATION (BATCH #{batch_num}/{MAX_BATCHES})</b>\n\n"
             f"💎 <b>Panel:</b> <code>{html.escape(panel_name)}</code> (All Online Unregistered)\n"
             f"📊 <b>Batch Progress:</b> {done_count}/{len(slots)} (🟢 {ok_count} | 🔴 {fail_count}) • <b>Total:</b> {success_count}/{total_needed}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -912,8 +968,10 @@ async def process_check_numbers_input(message: types.Message, state: FSMContext)
                 check_res = await client.black_check()
                 if check_res == "SKIP_EXISTS":
                     results.append(f"• <code>{html.escape(phone_num)}</code>: 🔴 <b>Already Registered</b>")
-                else:
+                elif check_res == "SUCCESS":
                     results.append(f"• <code>{html.escape(phone_num)}</code>: 🟢 <b>Unregistered / Available</b>")
+                else:
+                    results.append(f"• <code>{html.escape(phone_num)}</code>: ⚠️ Check Failed ({check_res})")
             except Exception:
                 results.append(f"• <code>{html.escape(phone_num)}</code>: ⚠️ Error checking")
             finally:
@@ -992,7 +1050,8 @@ async def process_device_id_scan(message: types.Message, state: FSMContext):
                         if phones:
                             num_lines = []
                             for full_phone in phones:
-                                badge = "🟢 Unregistered" if reg_cache.get(full_phone) else "🔴 Registered"
+                                st = reg_cache.get(full_phone)
+                                badge = "🟢 Unregistered" if st is True else ("🔴 Registered" if st is False else "⚠️ Unknown")
                                 num_lines.append(f"  • <code>{html.escape(full_phone)}</code> — {badge}")
                             report_blocks.append(
                                 f"🆔 <b>ID:</b> <code>{html.escape(cid)}</code> (DB: {html.escape(db_short_id)})\n" + "\n".join(num_lines)
@@ -1219,7 +1278,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
     async def run_batch_automation():
         import aiohttp
         firebase_dbs = USER_DATA["firebase_dbs"]
-        current_code = USER_DATA["codes"][0]
+        current_code = USER_DATA["codes"][0].strip()
         total_needed = TARGET_REGISTRATIONS
         success_count = 0
         registered_numbers = []
@@ -1231,7 +1290,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         board = BatchBoardLogger(status_msg)
 
         try:
-            while success_count < total_needed and USER_DATA["is_running"]:
+            while success_count < total_needed and batch_num < MAX_BATCHES and USER_DATA["is_running"]:
                 grouped = await collect_grouped_unregistered_devices(
                     firebase_dbs=firebase_dbs,
                     invite_code=current_code,
@@ -1259,13 +1318,13 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         break
 
                 if not batch_candidates:
+                    USER_DATA["is_running"] = False
                     await status_msg.edit_text(
-                        "🔴 <b>No unregistered online devices found.</b>\nRetrying in 3s...",
+                        "🔴 <b>No verified unregistered online devices available.</b>\nAutomation stopped.",
                         parse_mode="HTML",
                         reply_markup=get_main_menu()
                     )
-                    await asyncio.sleep(3)
-                    continue
+                    return
 
                 batch_num += 1
                 panel_name = batch_candidates[0]["db_panel_name"]
@@ -1277,7 +1336,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         "db_short_id": cand["db_short_id"],
                         "cid": cand["cid"],
                         "phone": cand["phone"],
-                        "status": "⏳ Requesting OTP...",
+                        "status": "🔗 Binding Refer Code...",
                         "done": False,
                         "ok": False,
                     })
@@ -1317,6 +1376,13 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             slot["done"] = True
                             return
 
+                        if send_status == "ATTRIBUTION_FAILED":
+                            skipped_phones.add(phone)
+                            slot["status"] = "❌ Refer Bind Failed (Aborted)"
+                            slot["done"] = True
+                            await board.render(panel_name, batch_num, success_count, total_needed, slots)
+                            return
+
                         if send_status == "SKIP_EXISTS":
                             skipped_phones.add(phone)
                             slot["status"] = "❌ Already Registered"
@@ -1343,8 +1409,14 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                         otp_found = None
                         start_poll = time.time()
-                        while time.time() - start_poll < OTP_TIMEOUT and USER_DATA["is_running"]:
+                        while (
+                            time.time() - start_poll < OTP_TIMEOUT
+                            and USER_DATA["is_running"]
+                            and not cap_reached_event.is_set()
+                        ):
                             await asyncio.sleep(POLL_INTERVAL)
+                            if cap_reached_event.is_set():
+                                break
                             try:
                                 async with aiohttp.ClientSession() as session:
                                     async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=15', timeout=5) as r:
@@ -1372,16 +1444,28 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             await board.render(panel_name, batch_num, success_count, total_needed, slots)
                             return
 
-                        # OTP arrived: force register without a verification timeout
+                        # Claim a referral slot BEFORE calling verify_otp so we never exceed 2 referrals
+                        async with state_lock:
+                            if success_count >= total_needed or cap_reached_event.is_set():
+                                cap_reached_event.set()
+                                skipped_phones.add(phone)
+                                slot["status"] = f"⏭️ OTP {otp_found} Ignored (Cap 2/2)"
+                                slot["done"] = True
+                                await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
+                                return
+
+                        # OTP arrived: force register without a timeout on network retries, but stop on explicit API rejection
                         attempt = 0
-                        v_res = "INVALID"
-                        while USER_DATA["is_running"] and attempt < MAX_FORCE_VERIFY_ATTEMPTS:
+                        v_res = "NETWORK_RETRY"
+                        while USER_DATA["is_running"]:
                             attempt += 1
                             slot["status"] = f"🔑 OTP {otp_found} • Force Reg #{attempt}..."
                             await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
                             v_res = await client.verify_otp(otp_found)
-                            if v_res in ("SUCCESS", "IP_LIMITED"):
+                            if v_res in ("SUCCESS", "IP_LIMITED", "ALREADY_EXISTS", "REJECTED_OTP", "ATTRIBUTION_FAILED"):
                                 break
+                            if USER_DATA["proxies"] and attempt % 3 == 0:
+                                await client.rotate_session()
                             await asyncio.sleep(1.0)
 
                         async with state_lock:
@@ -1391,16 +1475,26 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 slot["done"] = True
                                 if success_count < total_needed:
                                     success_count += 1
-                                    slot["status"] = f"✅ Force Registered ({success_count}/{total_needed})"
-                                    registered_numbers.append(f"{phone} (ID: {cid[:12]}, DB: {slot['db_short_id']})")
+                                    slot["status"] = f"✅ Verified Refer ({success_count}/{total_needed})"
+                                    registered_numbers.append(
+                                        f"{phone} (ID: {cid[:12]}, DB: {slot['db_short_id']}, UUID: {client.attribute_uuid[:8]})"
+                                    )
                                     if success_count >= total_needed:
                                         cap_reached_event.set()
                                 else:
-                                    slot["status"] = "✅ Force Registered (Extra)"
+                                    slot["status"] = "✅ Registered (Cap Reached)"
+                            elif v_res == "ALREADY_EXISTS":
+                                skipped_phones.add(phone)
+                                slot["done"] = True
+                                slot["status"] = "❌ Already Registered"
                             elif v_res == "IP_LIMITED":
                                 skipped_phones.add(phone)
                                 slot["done"] = True
                                 slot["status"] = "⚠️ IP Problem"
+                            elif v_res == "REJECTED_OTP":
+                                skipped_phones.add(phone)
+                                slot["done"] = True
+                                slot["status"] = f"❌ OTP Rejected ({client.last_api_msg[:20]})"
                             else:
                                 skipped_phones.add(phone)
                                 slot["done"] = True
@@ -1413,23 +1507,31 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 await asyncio.gather(*(process_slot(i) for i in range(len(slots))))
                 await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
 
-                if success_count < total_needed and USER_DATA["is_running"]:
+                if success_count >= total_needed:
+                    break
+
+                if USER_DATA["is_running"] and batch_num < MAX_BATCHES:
                     await asyncio.sleep(1.5)
 
             USER_DATA["is_running"] = False
             if success_count >= total_needed:
                 numbers_list_str = "\n".join([f"• <code>{html.escape(num)}</code>" for num in registered_numbers])
                 final_msg = (
-                    f"🎉 <b>HERO11 BATCH REGISTRATION COMPLETED!</b> 🎉\n"
+                    f"🎉 <b>HERO11 VERIFIED REFERRALS COMPLETED!</b> 🎉\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
+                    f"📝 <b>Refer Code:</b> <code>{html.escape(current_code)}</code>\n"
                     f"📦 <b>Batches Run:</b> {batch_num} (5 concurrent/batch)\n"
-                    f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
-                    f"📱 <b>Registered Numbers & Device IDs:</b>\n{numbers_list_str}\n"
+                    f"✅ <b>Verified Referrals:</b> {success_count}/{total_needed}\n"
+                    f"📱 <b>Registered Numbers & Attribution UUIDs:</b>\n{numbers_list_str}\n"
                     f"━━━━━━━━━━━━━━━━━━━━"
                 )
                 await callback.message.answer(final_msg, parse_mode="HTML", reply_markup=get_main_menu())
             else:
-                await callback.message.answer("🛑 <b>Batch Automation stopped.</b>", parse_mode="HTML", reply_markup=get_main_menu())
+                await callback.message.answer(
+                    f"🛑 <b>Batch Automation stopped after {batch_num} batch(es) ({success_count}/{total_needed} verified).</b>",
+                    parse_mode="HTML",
+                    reply_markup=get_main_menu()
+                )
 
         except asyncio.CancelledError:
             USER_DATA["is_running"] = False
