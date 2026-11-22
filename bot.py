@@ -783,8 +783,9 @@ class BatchBoardLogger:
         for idx, s in enumerate(slots, start=1):
             last4 = s["phone"][-4:]
             short_cid = s["cid"][:12]
+            otp_tag = f" [{s['otp']}]" if s.get("otp") else ""
             rows.append(
-                f"<code>[{idx:02d}] …{html.escape(last4)} ({html.escape(short_cid)})</code>  {s['status']}"
+                f"<code>[{idx:02d}] …{html.escape(last4)} ({html.escape(short_cid)}){html.escape(otp_tag)}</code>  {s['status']}"
             )
 
         rows_text = "\n".join(rows) if rows else "<i>Scanning all unregistered online devices...</i>"
@@ -1318,7 +1319,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     if batch_candidates:
                         break
 
-                    # Current Firebase DB has no more candidates; switch to next Firebase DB
                     fb_index += 1
                     if fb_index < len(firebase_dbs):
                         next_panel = firebase_dbs[fb_index].split('//')[1].split('.')[0]
@@ -1349,6 +1349,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         "db_short_id": cand["db_short_id"],
                         "cid": cand["cid"],
                         "phone": cand["phone"],
+                        "otp": None,
                         "status": "🔗 Binding Refer Code...",
                         "done": False,
                         "ok": False,
@@ -1420,7 +1421,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         slot["status"] = "📡 Waiting OTP (25s)..."
                         await board.render(panel_name, batch_num, success_count, total_needed, slots)
 
-                        otp_found = None
+                        own_otp = None
                         start_poll = time.time()
                         while (
                             time.time() - start_poll < OTP_TIMEOUT
@@ -1438,16 +1439,16 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                             for msg_key, msg_val in msgs.items():
                                                 if msg_key not in known_keys and isinstance(msg_val, dict):
                                                     txt = str(msg_val.get("body") or msg_val.get("message") or "")
-                                                    for otp in re.findall(r'\b\d{6}\b', txt):
-                                                        if otp not in ["000000", "123456", "111111", "999999"]:
-                                                            otp_found = otp
+                                                    for code_match in re.findall(r'\b\d{6}\b', txt):
+                                                        if code_match not in ["000000", "123456", "111111", "999999"]:
+                                                            own_otp = code_match
                                                             break
-                                            if otp_found:
+                                            if own_otp:
                                                 break
                             except Exception:
                                 pass
 
-                        if not otp_found:
+                        if not own_otp:
                             if cap_reached_event.is_set():
                                 slot["status"] = "⏭️ Ignored (Cap 2/2)"
                             else:
@@ -1457,11 +1458,13 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             await board.render(panel_name, batch_num, success_count, total_needed, slots)
                             return
 
+                        slot["otp"] = own_otp
+
                         async with state_lock:
                             if success_count >= total_needed or cap_reached_event.is_set():
                                 cap_reached_event.set()
                                 skipped_phones.add(phone)
-                                slot["status"] = f"⏭️ OTP {otp_found} Ignored (Cap 2/2)"
+                                slot["status"] = f"⏭️ OTP {own_otp} Ignored (Cap 2/2)"
                                 slot["done"] = True
                                 await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
                                 return
@@ -1470,9 +1473,9 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         v_res = "NETWORK_RETRY"
                         while USER_DATA["is_running"]:
                             attempt += 1
-                            slot["status"] = f"🔑 OTP {otp_found} • Force Reg #{attempt}..."
+                            slot["status"] = f"🔑 OTP {own_otp} • Force Reg #{attempt}..."
                             await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
-                            v_res = await client.verify_otp(otp_found)
+                            v_res = await client.verify_otp(own_otp)
                             if v_res in ("SUCCESS", "IP_LIMITED", "ALREADY_EXISTS", "REJECTED_OTP", "ATTRIBUTION_FAILED"):
                                 break
                             if USER_DATA["proxies"] and attempt % 3 == 0:
@@ -1486,14 +1489,14 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 slot["done"] = True
                                 if success_count < total_needed:
                                     success_count += 1
-                                    slot["status"] = f"✅ Verified Refer ({success_count}/{total_needed})"
+                                    slot["status"] = f"✅ Verified Refer ({success_count}/{total_needed}) [{own_otp}]"
                                     registered_numbers.append(
-                                        f"{phone} (ID: {cid[:12]}, DB: {slot['db_short_id']}, UUID: {client.attribute_uuid[:8]})"
+                                        f"{phone} (ID: {cid[:12]}, DB: {slot['db_short_id']}, OTP: {own_otp}, UUID: {client.attribute_uuid[:8]})"
                                     )
                                     if success_count >= total_needed:
                                         cap_reached_event.set()
                                 else:
-                                    slot["status"] = "✅ Registered (Cap Reached)"
+                                    slot["status"] = f"✅ Registered (Cap Reached) [{own_otp}]"
                             elif v_res == "ALREADY_EXISTS":
                                 skipped_phones.add(phone)
                                 slot["done"] = True
@@ -1505,11 +1508,11 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             elif v_res == "REJECTED_OTP":
                                 skipped_phones.add(phone)
                                 slot["done"] = True
-                                slot["status"] = f"❌ OTP Rejected ({client.last_api_msg[:20]})"
+                                slot["status"] = f"❌ OTP {own_otp} Rejected ({client.last_api_msg[:20]})"
                             else:
                                 skipped_phones.add(phone)
                                 slot["done"] = True
-                                slot["status"] = "❌ Force Reg Stopped"
+                                slot["status"] = f"❌ OTP {own_otp} Reg Stopped"
 
                         await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
                     finally:
@@ -1533,7 +1536,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     f"📝 <b>Refer Code:</b> <code>{html.escape(current_code)}</code>\n"
                     f"📦 <b>Batches Run:</b> {batch_num} (5 concurrent/batch)\n"
                     f"✅ <b>Verified Referrals:</b> {success_count}/{total_needed}\n"
-                    f"📱 <b>Registered Numbers & Attribution UUIDs:</b>\n{numbers_list_str}\n"
+                    f"📱 <b>Registered Numbers, OTPs & UUIDs:</b>\n{numbers_list_str}\n"
                     f"━━━━━━━━━━━━━━━━━━━━"
                 )
                 await callback.message.answer(final_msg, parse_mode="HTML", reply_markup=get_main_menu())
