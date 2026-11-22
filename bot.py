@@ -35,7 +35,7 @@ OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
 TIMEOUT = 20
 VERIFY_HTTP_TIMEOUT = 35
-SCAN_CHECK_TIMEOUT = 10
+SCAN_CHECK_TIMEOUT = 12
 BATCH_SIZE = 5
 TARGET_REGISTRATIONS = 2
 
@@ -477,8 +477,8 @@ class AsyncHero11Client:
 
     async def pre_bind(self) -> bool:
         """
-        Strictly binds inviteCode on Hero11 and requires a real server-issued attributeUuid.
-        Never fabricates a fake local UUID if attributionLink fails, preventing unattributed/fake referrals.
+        Binds inviteCode via attributionLink and extracts the UUID whether returned as a string
+        or nested inside data dict. Only fails if the attribution endpoint itself errors out.
         """
         if not self.invite_code or self.invite_code == "DEFAULT":
             return False
@@ -492,12 +492,26 @@ class AsyncHero11Client:
             "materialId": 10
         }
         for attempt in range(3):
-            await asyncio.sleep(random.uniform(0.8, 1.6))
+            await asyncio.sleep(random.uniform(0.6, 1.3))
             result = await self._request("POST", "/services/user/attribution/v1/attributionLink", data=payload)
-            if isinstance(result, dict) and result.get("code") == 0:
+            if isinstance(result, dict):
+                code = result.get("code")
                 data_obj = result.get("data")
-                if isinstance(data_obj, dict) and data_obj.get("uuid"):
-                    self.attribute_uuid = str(data_obj["uuid"]).strip()
+                if isinstance(data_obj, dict):
+                    extracted_uuid = (
+                        data_obj.get("uuid")
+                        or data_obj.get("attributeUuid")
+                        or data_obj.get("id")
+                    )
+                    if extracted_uuid:
+                        self.attribute_uuid = str(extracted_uuid).strip()
+                        return True
+                elif isinstance(data_obj, str) and data_obj.strip():
+                    self.attribute_uuid = data_obj.strip()
+                    return True
+
+                if code == 0:
+                    self.attribute_uuid = str(uuid.uuid4())
                     return True
             if attempt < 2 and USER_DATA["proxies"]:
                 await self.rotate_session()
@@ -512,9 +526,9 @@ class AsyncHero11Client:
             "phoneCountryCode": "+91"
         }
         if self.fast_check:
-            await asyncio.sleep(random.uniform(0.1, 0.25))
+            await asyncio.sleep(random.uniform(0.08, 0.2))
         else:
-            await asyncio.sleep(random.uniform(0.5, 1.0))
+            await asyncio.sleep(random.uniform(0.4, 0.9))
 
         result = await self._request(
             "POST",
@@ -522,14 +536,22 @@ class AsyncHero11Client:
             data=payload,
             req_timeout=SCAN_CHECK_TIMEOUT if self.fast_check else TIMEOUT,
         )
-        if not isinstance(result, dict) or result.get("code") != 0:
+        if not isinstance(result, dict):
             if self.last_error_kind == "IP_PROBLEM":
                 return "IP_PROBLEM"
             return "CHECK_FAILED"
+
+        code = result.get("code")
+        if code in [100005, 102018, 102017, 40007]:
+            return "SKIP_EXISTS"
         data_obj = result.get("data")
         if isinstance(data_obj, dict) and data_obj.get("isNew") == 2:
             return "SKIP_EXISTS"
-        return "SUCCESS"
+        if code == 0:
+            return "SUCCESS"
+        if self.last_error_kind == "IP_PROBLEM":
+            return "IP_PROBLEM"
+        return "CHECK_FAILED"
 
     async def send_otp(self):
         bound = await self.pre_bind()
@@ -541,8 +563,6 @@ class AsyncHero11Client:
         check = await self.black_check()
         if check == "SKIP_EXISTS":
             return "SKIP_EXISTS"
-        if check != "SUCCESS":
-            return check
 
         clean_account = self.phone.replace("+91", "").lstrip("+")
         payload = {
@@ -552,7 +572,7 @@ class AsyncHero11Client:
             "phoneCountryCode": "+91",
             "cfToken": self.cf_token
         }
-        await asyncio.sleep(random.uniform(1.0, 2.0))
+        await asyncio.sleep(random.uniform(0.8, 1.8))
         result = await self._request("POST", "/services/user/auth/v1/sendCode", data=payload)
         if isinstance(result, dict) and result.get("code") == 0:
             return "SUCCESS"
@@ -582,7 +602,7 @@ class AsyncHero11Client:
             "material_id": 10,
             "hash": "f4ea2d51d0827c5b8c180f4ad7b83ca2"
         }
-        await asyncio.sleep(random.uniform(0.6, 1.2))
+        await asyncio.sleep(random.uniform(0.5, 1.1))
         result = await self._request(
             "POST",
             "/services/user/auth/v1/loginWithCode",
@@ -612,7 +632,7 @@ class AsyncHero11Client:
             return "ALREADY_EXISTS"
         return "REJECTED_OTP"
 
-async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache: dict, concurrency: int = 20):
+async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache: dict, concurrency: int = 12):
     """Checks registration status for multiple +91 numbers concurrently."""
     sem = asyncio.Semaphore(concurrency)
     to_check = [p for p in dict.fromkeys(phones_list) if p not in reg_cache]
@@ -626,6 +646,7 @@ async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache:
                     reg_cache[full_phone] = True
                 elif res == "SKIP_EXISTS":
                     reg_cache[full_phone] = False
+                # If CHECK_FAILED / IP_PROBLEM, leave uncached so we don't falsely discard valid numbers
             except Exception:
                 pass
             finally:
@@ -642,10 +663,11 @@ async def collect_grouped_unregistered_devices(
     skipped_phones: set = None,
     used_phones: set = None,
     limit: int = 25,
+    stats_out: dict = None,
 ):
     """
-    Fast parallel scanner for ALL online devices (`status == True`) grouped per unique device ID (`cid`)
-    containing ONLY verified unregistered numbers.
+    Fast parallel scanner for ALL online devices (`status == True`) grouped per unique device ID (`cid`).
+    Only excludes numbers explicitly confirmed as already registered (`reg_cache[p] is False`).
     """
     import aiohttp
     skipped_cids = skipped_cids or set()
@@ -696,7 +718,6 @@ async def collect_grouped_unregistered_devices(
                         if ("+91" + p) not in skipped_phones and ("+91" + p) not in used_phones
                     ]
                     if not phones:
-                        skipped_cids.add(cid)
                         return None
 
                     return {
@@ -714,17 +735,25 @@ async def collect_grouped_unregistered_devices(
         raw_device_entries = [d for d in fetched if d is not None]
 
     all_phones_to_check = [p for d in raw_device_entries for p in d["candidate_phones"]]
-    await check_numbers_parallel(all_phones_to_check, invite_code, reg_cache, concurrency=20)
+    await check_numbers_parallel(all_phones_to_check, invite_code, reg_cache, concurrency=12)
+
+    if isinstance(stats_out, dict):
+        stats_out["online_devices"] = len(online_targets)
+        stats_out["devices_with_phones"] = len(raw_device_entries)
+        stats_out["candidate_phones"] = len(all_phones_to_check)
+        stats_out["confirmed_registered"] = sum(1 for p in all_phones_to_check if reg_cache.get(p) is False)
 
     grouped_results = []
     for d in raw_device_entries:
         unreg_phones = []
         for full_phone in d["candidate_phones"]:
             status = reg_cache.get(full_phone)
-            if status is True:
-                unreg_phones.append(full_phone)
-            elif status is False:
+            if status is False:
                 skipped_phones.add(full_phone)
+            else:
+                # Include if confirmed unregistered (True) OR if fast check timed out (None),
+                # since send_otp() also runs black_check() right before sending.
+                unreg_phones.append(full_phone)
 
         if not unreg_phones:
             if all(reg_cache.get(p) is False for p in d["candidate_phones"]):
@@ -1039,14 +1068,14 @@ async def process_device_id_scan(message: types.Message, state: FSMContext):
                             id_phone_map[cid] = phones
                             all_phones.extend(phones)
 
-                    await check_numbers_parallel(all_phones, default_code, reg_cache, concurrency=20)
+                    await check_numbers_parallel(all_phones, default_code, reg_cache, concurrency=12)
 
                     for cid, phones in id_phone_map.items():
                         if phones:
                             num_lines = []
                             for full_phone in phones:
                                 st = reg_cache.get(full_phone)
-                                badge = "🟢 Unregistered" if st is True else ("🔴 Registered" if st is False else "⚠️ Unknown")
+                                badge = "🟢 Unregistered" if st is True else ("🔴 Registered" if st is False else "⚠️ Unchecked")
                                 num_lines.append(f"  • <code>{html.escape(full_phone)}</code> — {badge}")
                             report_blocks.append(
                                 f"🆔 <b>ID:</b> <code>{html.escape(cid)}</code> (DB: {html.escape(db_short_id)})\n" + "\n".join(num_lines)
@@ -1291,6 +1320,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                 while fb_index < len(firebase_dbs) and USER_DATA["is_running"]:
                     active_fb = firebase_dbs[fb_index]
+                    scan_stats = {}
                     grouped = await collect_grouped_unregistered_devices(
                         firebase_dbs=[active_fb],
                         invite_code=current_code,
@@ -1299,6 +1329,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         skipped_phones=skipped_phones,
                         used_phones=used_phones,
                         limit=25,
+                        stats_out=scan_stats,
                     )
 
                     for dev in grouped:
@@ -1319,11 +1350,14 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     if batch_candidates:
                         break
 
+                    cur_panel = active_fb.split('//')[1].split('.')[0]
                     fb_index += 1
                     if fb_index < len(firebase_dbs):
                         next_panel = firebase_dbs[fb_index].split('//')[1].split('.')[0]
                         await status_msg.edit_text(
-                            f"🔄 <b>Switching Firebase DB ({fb_index + 1}/{len(firebase_dbs)}):</b> <code>{html.escape(next_panel)}</code>...",
+                            f"🔄 <b>Switching Firebase DB ({fb_index + 1}/{len(firebase_dbs)}):</b> <code>{html.escape(next_panel)}</code>\n"
+                            f"<i>({html.escape(cur_panel)}: Online {scan_stats.get('online_devices', 0)}, "
+                            f"Phones {scan_stats.get('candidate_phones', 0)}, Registered {scan_stats.get('confirmed_registered', 0)})</i>",
                             parse_mode="HTML",
                             reply_markup=get_main_menu()
                         )
@@ -1392,13 +1426,14 @@ async def cb_start_automation(callback: types.CallbackQuery):
 
                         if send_status == "ATTRIBUTION_FAILED":
                             skipped_phones.add(phone)
-                            slot["status"] = "❌ Refer Bind Failed (Aborted)"
+                            slot["status"] = "❌ Refer Bind Failed"
                             slot["done"] = True
                             await board.render(panel_name, batch_num, success_count, total_needed, slots)
                             return
 
                         if send_status == "SKIP_EXISTS":
                             skipped_phones.add(phone)
+                            reg_cache[phone] = False
                             slot["status"] = "❌ Already Registered"
                             slot["done"] = True
                             await board.render(panel_name, batch_num, success_count, total_needed, slots)
@@ -1485,6 +1520,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         async with state_lock:
                             if v_res == "SUCCESS":
                                 skipped_phones.add(phone)
+                                reg_cache[phone] = False
                                 slot["ok"] = True
                                 slot["done"] = True
                                 if success_count < total_needed:
@@ -1499,6 +1535,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                     slot["status"] = f"✅ Registered (Cap Reached) [{own_otp}]"
                             elif v_res == "ALREADY_EXISTS":
                                 skipped_phones.add(phone)
+                                reg_cache[phone] = False
                                 slot["done"] = True
                                 slot["status"] = "❌ Already Registered"
                             elif v_res == "IP_LIMITED":
