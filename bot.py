@@ -30,7 +30,10 @@ if hasattr(time, "tzset"):
 IST = timezone(timedelta(hours=5, minutes=30))
 BOT_TOKEN = os.getenv("BOT_TOKEN", "8878529173:AAGEudmva_H54NuTEfmdCdq4AKibM1M4rgM").strip()
 ADMIN_ID = int(os.getenv("ADMIN_ID", "8337013809"))
-SOLVERIFY_API_KEY = os.getenv("SOLVERIFY_API_KEY", "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg").strip()
+SOLVERIFY_API_KEY = os.getenv(
+    "SOLVERIFY_API_KEY",
+    "RqHPFHbQCNwItxqfh21kDmH0Sx2bR0dBdDH1P9QLuFU6hspmbsQIYzxZ5DOURVbg",
+).strip()
 OTP_TIMEOUT = 25
 POLL_INTERVAL = 2
 TIMEOUT = 20
@@ -478,6 +481,9 @@ class AsyncHero11Client:
             return None
 
     async def pre_bind(self) -> bool:
+        """
+        Binds inviteCode via attributionLink and requires a real server-issued UUID.
+        """
         if not self.invite_code or self.invite_code == "DEFAULT":
             return False
 
@@ -561,6 +567,8 @@ class AsyncHero11Client:
         check = await self.black_check()
         if check == "SKIP_EXISTS":
             return "SKIP_EXISTS"
+        if check != "SUCCESS":
+            return check
 
         clean_account = self.phone.replace("+91", "").lstrip("+")
         payload = {
@@ -572,13 +580,19 @@ class AsyncHero11Client:
         }
         await asyncio.sleep(random.uniform(0.8, 1.8))
         result = await self._request("POST", "/services/user/auth/v1/sendCode", data=payload)
-        if isinstance(result, dict) and result.get("code") == 0:
+        if not isinstance(result, dict):
+            if self.last_error_kind == "IP_PROBLEM":
+                return "IP_PROBLEM"
+            return "SEND_FAILED"
+
+        code = result.get("code")
+        if code == 0:
             return "SUCCESS"
-        if isinstance(result, dict) and result.get("code") in [100005, 102018, 102017, 40007]:
+        if code in [100005, 102018, 102017, 40007]:
             return "SKIP_EXISTS"
         if self.last_error_kind == "IP_PROBLEM":
             return "IP_PROBLEM"
-        return "SEND_FAILED"
+        return f"SEND_REJECTED:{code}"
 
     async def verify_otp(self, otp_code):
         if not self.attribute_uuid:
@@ -631,7 +645,7 @@ class AsyncHero11Client:
         return "REJECTED_OTP"
 
 async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache: dict, concurrency: int = 12):
-    """Checks registration status for multiple +91 numbers concurrently."""
+    """Checks registration status for multiple +91 numbers concurrently with 1 proxy retry on timeout."""
     sem = asyncio.Semaphore(concurrency)
     to_check = [p for p in dict.fromkeys(phones_list) if p not in reg_cache]
 
@@ -640,6 +654,10 @@ async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache:
             client = AsyncHero11Client(full_phone, invite_code, fast_check=True)
             try:
                 res = await client.black_check()
+                if res == "CHECK_FAILED" and USER_DATA["proxies"]:
+                    await client.rotate_session()
+                    res = await client.black_check()
+
                 if res == "SUCCESS":
                     reg_cache[full_phone] = True
                 elif res == "SKIP_EXISTS":
@@ -664,7 +682,7 @@ async def collect_grouped_unregistered_devices(
 ):
     """
     Fast parallel scanner for ALL online devices (`status == True`) grouped per unique device ID (`cid`)
-    containing ONLY verified unregistered numbers.
+    containing ONLY confirmed unregistered numbers (`reg_cache[p] is True`).
     """
     import aiohttp
     skipped_cids = skipped_cids or set()
@@ -745,10 +763,10 @@ async def collect_grouped_unregistered_devices(
         unreg_phones = []
         for full_phone in d["candidate_phones"]:
             status = reg_cache.get(full_phone)
-            if status is False:
-                skipped_phones.add(full_phone)
-            else:
+            if status is True:
                 unreg_phones.append(full_phone)
+            elif status is False:
+                skipped_phones.add(full_phone)
 
         if not unreg_phones:
             if all(reg_cache.get(p) is False for p in d["candidate_phones"]):
@@ -1443,6 +1461,14 @@ async def cb_start_automation(callback: types.CallbackQuery):
                         if send_status == "IP_PROBLEM":
                             skipped_phones.add(phone)
                             slot["status"] = "⚠️ IP Problem"
+                            slot["done"] = True
+                            await board.render(panel_name, batch_num, success_count, total_needed, slots)
+                            return
+
+                        if isinstance(send_status, str) and send_status.startswith("SEND_REJECTED:"):
+                            err_code = send_status.split(":", 1)[1]
+                            skipped_phones.add(phone)
+                            slot["status"] = f"❌ Send Rejected (code: {err_code})"
                             slot["done"] = True
                             await board.render(panel_name, batch_num, success_count, total_needed, slots)
                             return
